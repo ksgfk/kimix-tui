@@ -122,6 +122,13 @@ def load_kimix_sdk_config(config_file: Path) -> Config:
     return _build_sdk_config(provider_dict, path)
 
 
+def load_kimix_provider_dict(config_file: Path) -> dict[str, Any]:
+    """Load the normalized provider mapping consumed by Kimix session factories."""
+
+    _path, provider_dict = _load_kimix_provider_json(config_file)
+    return provider_dict
+
+
 def _load_kimix_provider_json(config_file: Path) -> tuple[Path, dict[str, Any]]:
     path = config_file.expanduser().resolve(strict=False)
     if path.suffix.lower() != ".json":

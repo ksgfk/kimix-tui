@@ -7,9 +7,9 @@ from typing import ClassVar
 from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Input, Label, Static
+from textual.widgets import Button, Input, Label, Static
 
 
 class RequestModalScreen[ScreenResult](ModalScreen[ScreenResult]):
@@ -37,11 +37,22 @@ class RequestModalScreen[ScreenResult](ModalScreen[ScreenResult]):
     }
 
     .dialog-body { margin-bottom: 1; }
+
+    #approval-actions {
+        height: 3;
+        align: right middle;
+    }
+
+    #approval-actions Button {
+        min-width: 14;
+        height: 3;
+        margin-left: 1;
+    }
     """
 
 
 class ApprovalScreen(RequestModalScreen[str]):
-    """Resolve a SDK approval or hook request without mouse interaction."""
+    """Resolve a SDK approval or hook request."""
 
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("a", "choose('approve')", "Approve"),
@@ -58,7 +69,25 @@ class ApprovalScreen(RequestModalScreen[str]):
         with Vertical(id="decision-dialog"):
             yield Label(self._title, classes="dialog-title")
             yield Static(self._description, classes="dialog-body")
-            yield Static("[a] approve   [s] approve for session   [r/Esc] reject")
+            with Horizontal(id="approval-actions"):
+                yield Button("Reject", id="reject", variant="error")
+                yield Button("Approve session", id="approve-for-session")
+                yield Button("Approve", id="approve", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#approve", Button).focus()
+
+    @on(Button.Pressed, "#approve")
+    def press_approve(self) -> None:
+        self.action_choose("approve")
+
+    @on(Button.Pressed, "#approve-for-session")
+    def press_approve_for_session(self) -> None:
+        self.action_choose("approve_for_session")
+
+    @on(Button.Pressed, "#reject")
+    def press_reject(self) -> None:
+        self.action_choose("reject")
 
     def action_choose(self, decision: str) -> None:
         self.dismiss(decision)

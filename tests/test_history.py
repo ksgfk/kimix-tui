@@ -19,8 +19,10 @@ from kimi_agent_sdk import (
 from kimix_tui.history import (
     HistoryAccumulator,
     HistoryBlock,
+    _scan_wire_history_index,
     blocks_from_wire_messages,
     load_session_history,
+    load_wire_history_page,
     take_last_turns,
 )
 
@@ -48,6 +50,24 @@ def test_blocks_merge_stream_and_keep_user_turns() -> None:
         HistoryBlock("thinking", "looking at auth"),
         HistoryBlock("assistant", "Check the redirect."),
         HistoryBlock("user", "also cookies"),
+    ]
+
+
+def test_history_keeps_full_user_and_assistant_messages() -> None:
+    user_text = "user " + ("u" * 4_500)
+    assistant_text = "assistant " + ("a" * 4_500)
+
+    blocks = blocks_from_wire_messages(
+        [
+            TurnBegin(user_input=user_text),
+            TextPart(text=assistant_text[:2_000]),
+            TextPart(text=assistant_text[2_000:]),
+        ]
+    )
+
+    assert blocks == [
+        HistoryBlock("user", user_text),
+        HistoryBlock("assistant", assistant_text),
     ]
 
 
@@ -115,6 +135,103 @@ async def test_load_session_history_keeps_all_turns_by_default(tmp_path: Path) -
         "q4",
         "q5",
     ]
+
+
+async def test_load_session_history_reads_only_tail_turns_from_wire_file(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KIMI_SHARE_DIR", str(tmp_path / "share"))
+    from kaos.path import KaosPath
+    from kimi_cli.session import Session as CliSession
+
+    work_dir = tmp_path / "project"
+    kaos_dir = KaosPath.unsafe_from_local_path(work_dir.resolve()).canonical()
+    session = await CliSession.create(kaos_dir, "tail-session")
+    await session.wire_file.open()
+    try:
+        for index in range(5):
+            await session.wire_file.append_message(TurnBegin(user_input=f"q{index}"))
+            await session.wire_file.append_message(
+                TextPart(text=f'a{index} includes \\"message\\":{{\\"type\\":\\"TurnBegin\\"}}')
+            )
+            await session.wire_file.append_message(TurnEnd())
+    finally:
+        await session.wire_file.close()
+
+    history = await load_session_history(work_dir, session.id, max_turns=2, max_blocks=10)
+
+    assert history.omitted_turns == 3
+    assert [block.text for block in history.blocks if block.kind == "user"] == ["q3", "q4"]
+    assert [block.text for block in history.blocks if block.kind == "assistant"] == [
+        'a3 includes \\"message\\":{\\"type\\":\\"TurnBegin\\"}',
+        'a4 includes \\"message\\":{\\"type\\":\\"TurnBegin\\"}',
+    ]
+
+
+async def test_indexed_history_pages_read_only_requested_turns(tmp_path: Path) -> None:
+    from kimi_cli.wire.file import WireFile
+
+    wire_file = WireFile(tmp_path / "wire.jsonl")
+    await wire_file.open()
+    try:
+        for index in range(6):
+            await wire_file.append_message(TurnBegin(user_input=f"q{index}"))
+            await wire_file.append_message(TextPart(text=f"a{index}"))
+            await wire_file.append_message(TurnEnd())
+    finally:
+        await wire_file.close()
+
+    wire_index = _scan_wire_history_index(wire_file.path)
+    assert wire_index.total_turns == 6
+
+    latest = await load_wire_history_page(wire_index, end_turn=6, page_turns=2)
+    assert latest.start_turn == 4
+    assert latest.end_turn == 6
+    assert latest.has_older is True
+    assert [block.text for block in latest.blocks if block.kind == "user"] == ["q4", "q5"]
+
+    older = await load_wire_history_page(wire_index, end_turn=4, page_turns=2)
+    assert older.start_turn == 2
+    assert older.end_turn == 4
+    assert [block.text for block in older.blocks if block.kind == "user"] == ["q2", "q3"]
+
+
+async def test_indexed_history_disables_json_string_cache(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import pydantic_core
+    from kimi_cli.wire.file import WireFile
+
+    wire_file = WireFile(tmp_path / "wire.jsonl")
+    await wire_file.open()
+    try:
+        for index in range(3):
+            await wire_file.append_message(TurnBegin(user_input=f"q-{index}"))
+            await wire_file.append_message(TextPart(text=f"a-{index}"))
+            await wire_file.append_message(TurnEnd())
+    finally:
+        await wire_file.close()
+
+    cache_settings: list[object] = []
+    real_from_json = pydantic_core.from_json
+
+    def record_cache_setting(data: object, *args: object, **kwargs: object) -> object:
+        cache_settings.append(kwargs.get("cache_strings"))
+        return real_from_json(data, *args, **kwargs)
+
+    monkeypatch.setattr(pydantic_core, "from_json", record_cache_setting)
+    wire_index = _scan_wire_history_index(wire_file.path)
+    history = await load_wire_history_page(wire_index, end_turn=3, page_turns=3)
+
+    assert [block.text for block in history.blocks if block.kind == "user"] == [
+        "q-0",
+        "q-1",
+        "q-2",
+    ]
+    assert cache_settings
+    assert set(cache_settings) == {False}
 
 
 def test_unknown_objects_are_ignored() -> None:

@@ -45,6 +45,7 @@ def test_user_keeps_cyan_label_and_raw_markdown() -> None:
 
     assert "You" in plain
     assert "**bold**" in plain
+    assert "⧉" in plain
     assert any(style is not None and "cyan" in str(style).lower() for style in styles)
 
 
@@ -76,6 +77,66 @@ def test_thinking_uses_muted_italic() -> None:
     )
     styles = _styles(strips)
     assert any(style is not None and style.italic for style in styles)
+
+
+def test_non_dialogue_records_are_compacted_to_one_line() -> None:
+    strips = render_record_strips(
+        "tool_result",
+        "Read file succeeded\nCall ID: call-123\nOutput: a very detailed result",
+        width=48,
+        console=_console(),
+    )
+
+    assert len(strips) == 1
+    assert "▸ Result" in _plain(strips)
+    assert "Read file succeeded" in _plain(strips)
+    assert "Call ID" not in _plain(strips)
+    assert "Output" in _plain(strips)
+
+
+def test_tool_summary_prioritizes_arguments_over_call_metadata() -> None:
+    strips = render_record_strips(
+        "tool",
+        'read_file\nCall ID: call-123\nArguments:\n{\n  "path": "demo.py"\n}',
+        width=48,
+        console=_console(),
+    )
+
+    plain = _plain(strips)
+    assert len(strips) == 1
+    assert "read_file" in plain
+    assert "demo.py" in plain
+    assert "Call ID" not in plain
+
+
+def test_expanded_non_dialogue_records_show_the_full_message() -> None:
+    strips = render_record_strips(
+        "tool_result",
+        "Read file succeeded\nCall ID: call-123\nOutput: all details",
+        width=48,
+        console=_console(),
+        expanded=True,
+    )
+
+    plain = _plain(strips)
+    assert len(strips) > 1
+    assert "▾ Result" in plain
+    assert "Call ID: call-123" in plain
+    assert "Output: all details" in plain
+
+
+def test_compacted_records_use_ascii_ellipsis_when_clipped() -> None:
+    strips = render_record_strips(
+        "system",
+        "This status message is much too long for the available space",
+        width=24,
+        console=_console(),
+    )
+
+    plain = _plain(strips)
+    assert len(strips) == 1
+    assert "This..." in plain
+    assert plain.rstrip().endswith("⧉")
 
 
 def test_transcript_text_has_no_background_colors() -> None:

@@ -14,6 +14,9 @@ dependencies = [
     "textual>=8.2,<9",
 ]
 
+[tool.uv.sources]
+kimix = { path = "../Kimi-CLI-X", editable = true }
+
 [project.scripts]
 kimix-tui = "kimix_tui.__main__:main"
 

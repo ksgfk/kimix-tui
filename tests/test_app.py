@@ -253,6 +253,144 @@ async def test_resumed_session_shows_recent_history(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_chat_loads_older_history_pages_without_losing_latest_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePager:
+        total_turns = 130
+
+        @staticmethod
+        def _page(end_turn: int, page_turns: int) -> SessionHistory:
+            end = min(FakePager.total_turns, max(0, end_turn))
+            start = max(0, end - max(1, page_turns))
+            blocks = [
+                block
+                for index in range(start, end)
+                for block in (
+                    HistoryBlock("user", f"q{index}"),
+                    HistoryBlock("assistant", f"a{index}"),
+                )
+            ]
+            return SessionHistory(
+                blocks=blocks,
+                omitted_turns=start,
+                total_turns=FakePager.total_turns,
+                start_turn=start,
+                end_turn=end,
+                has_older=start > 0,
+            )
+
+        async def latest(self, *, page_turns: int | None = None) -> SessionHistory:
+            return self._page(self.total_turns, page_turns or 4)
+
+        async def before(
+            self,
+            end_turn: int,
+            *,
+            page_turns: int | None = None,
+        ) -> SessionHistory:
+            return self._page(end_turn, page_turns or 4)
+
+        async def ending_at(
+            self,
+            end_turn: int,
+            *,
+            page_turns: int | None = None,
+        ) -> SessionHistory:
+            return self._page(end_turn, page_turns or 4)
+
+    import kimix_tui.screens.chat as chat_module
+
+    async def _pager() -> FakePager:
+        return FakePager()
+
+    monkeypatch.setattr(chat_module, "create_history_pager", lambda *_args, **_kwargs: _pager())
+
+    session = FakeSession([])
+
+    async def factory(_options: SessionOptions) -> FakeSession:
+        return session
+
+    app = KimixTuiApp(
+        SessionOptions(tmp_path, session_id="fake-session"),
+        session_factory=factory,
+        config_store=_config_store(tmp_path),
+    )
+    async with app.run_test(size=(40, 35)) as pilot:
+        await app.workers.wait_for_complete()
+        chat = app.screen
+        assert isinstance(chat, ChatScreen)
+        assert chat.has_class("-narrow")
+        assert str(chat.query_one("#history-info", Static).content).startswith(
+            "History · turns 127-130 of 130"
+        )
+        assert all(
+            button.region.right <= chat.size.width
+            for button in chat.query("#history-actions Button")
+        )
+        turn_input = chat.query_one("#history-turn", Input)
+        assert turn_input.region.right <= chat.size.width
+        assert turn_input.placeholder == "Turn 1-130"
+        await pilot.click("#load-older")
+        await app.workers.wait_for_complete()
+        assert any(record.text == "q122" for record in chat.transcript.records)
+        assert any(record.text == "q129" for record in chat.transcript.records)
+
+        await pilot.press("ctrl+up")
+        await app.workers.wait_for_complete()
+        assert any(record.text == "q118" for record in chat.transcript.records)
+
+        chat.transcript.scroll_to(y=0, animate=False, immediate=True, force=True)
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+
+        await pilot.press("f3")
+        assert turn_input.has_focus
+        turn_input.value = "5"
+        await pilot.press("enter")
+        await app.workers.wait_for_complete()
+
+        texts = [record.text for record in chat.transcript.records]
+        assert "q4" in texts
+        assert "q3" not in texts
+        assert str(chat.query_one("#history-info", Static).content).startswith(
+            "History · turns 5-68 of 130"
+        )
+        visible = "\n".join(
+            chat.transcript.render_line(y).text for y in range(chat.transcript.size.height)
+        )
+        assert "q4" in visible
+
+        chat.transcript.scroll_to(y=0, animate=False, immediate=True, force=True)
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        assert any(record.text == "q0" for record in chat.transcript.records)
+        assert any(record.text == "q3" for record in chat.transcript.records)
+
+        await pilot.click("#load-newer")
+        await app.workers.wait_for_complete()
+        texts = [record.text for record in chat.transcript.records]
+        assert "q4" in texts
+        assert "q67" in texts
+        assert "q68" not in texts
+
+        chat.transcript.scroll_end(animate=False, immediate=True, force=True)
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        texts = [record.text for record in chat.transcript.records]
+        assert "q68" in texts
+        assert "q129" in texts
+        assert "q67" not in texts
+
+        await pilot.click("#jump-latest")
+        await app.workers.wait_for_complete()
+        texts = [record.text for record in chat.transcript.records]
+        assert "q66" in texts
+        assert "q65" not in texts
+
+
+@pytest.mark.asyncio
 async def test_approval_is_resolved_from_keyboard(tmp_path: Path) -> None:
     approval = ApprovalRequest(
         id="approval-1",
@@ -286,6 +424,42 @@ async def test_approval_is_resolved_from_keyboard(tmp_path: Path) -> None:
         assert await approval.wait() == "approve"
         assert app.screen is chat
         assert any(record.text == "done" for record in chat.transcript.records)
+
+
+@pytest.mark.asyncio
+async def test_approval_is_resolved_by_clicking_approve(tmp_path: Path) -> None:
+    approval = ApprovalRequest(
+        id="approval-1",
+        tool_call_id="call-1",
+        sender="write",
+        action="write file",
+        description="Write a.py",
+    )
+    session = FakeSession([approval, TurnEnd()])
+
+    async def factory(_options: SessionOptions) -> FakeSession:
+        return session
+
+    app = KimixTuiApp(
+        SessionOptions(tmp_path, session_id="fake-session"),
+        session_factory=factory,
+        config_store=_config_store(tmp_path),
+    )
+    async with app.run_test(size=(100, 35)) as pilot:
+        await app.workers.wait_for_complete()
+        chat = app.screen
+        assert isinstance(chat, ChatScreen)
+        chat.query_one("#prompt", Input).focus()
+
+        await pilot.press("g", "o", "enter")
+        await pilot.pause()
+        approval_screen = app.screen
+        assert isinstance(approval_screen, ApprovalScreen)
+        await pilot.click("#approve")
+        await app.workers.wait_for_complete()
+
+        assert await approval.wait() == "approve"
+        assert app.screen is chat
 
 
 @pytest.mark.asyncio

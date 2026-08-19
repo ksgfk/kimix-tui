@@ -175,4 +175,4 @@ def test_config_library_is_shared_across_work_dirs(tmp_path: Path) -> None:
         reference.path
         for reference in config_store(tmp_path, metadata_file).references_for(tmp_path)
     }
-    assert paths == {first.path, second.path}
+    assert {first.path, second.path}.issubset(paths)

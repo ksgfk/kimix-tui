@@ -1,15 +1,15 @@
 # kimix-tui
 
-一个独立、纯 Python的 Kimix TUI 原型。聊天循环消费
-`kimi_agent_sdk` 顶层公开接口；启动时的历史会话列表按 kimi-cli 的
-工作目录存储规则扫描，不扩展 SDK。
+一个独立、纯 Python 的 Kimix TUI。聊天循环通过 Kimix 公开的异步
+Worker 会话工厂创建与恢复会话；启动时的历史会话列表按 kimi-cli 的
+工作目录存储规则扫描。
 
 ## 当前能力
 
 - 无 `--session` 时先进入主页，可预览、恢复已有会话或新建
 - 按标题搜索会话，支持单选、多选当前结果和确认后批量删除
-- 恢复会话时回放 `wire.jsonl` 中的对话（用户/回复/思考/工具），可往上滚动查看
-- 使用 `Session.create()` / `Session.resume()` 创建或恢复会话
+- 恢复会话时按 turn 分页回放 `wire.jsonl` 中的对话（用户/回复/思考/工具），到达顶部可继续加载更早记录，也可输入 turn 编号直接跳转
+- 使用 `kimix.create_session_async()` 创建或恢复完整的 Kimix Worker 会话
 - 增量显示回复和思考内容；AI 回复支持标题、加粗、代码等简单 Markdown
 - 展示工具调用、工具结果、步骤和上下文状态
 - 键盘审批：批准、会话内批准、拒绝
@@ -17,6 +17,7 @@
 - 管理多个 LLM 配置，为新会话和每个历史 session 选择独立配置，并保存脱敏引用
 - `Ctrl+G` 取消当前生成
 - `/clear`、`/compact`、`/status`、`/help`、`/quit`（`/quit` 回到主页，不结束进程）
+- 大历史会话先加载最近 4 个 turn / 32 个展示块；顶部加载使用一次索引扫描和按区间读取，最多在连续滚动窗口保留 64 个 turn，窗口满后可用 `Earlier` / `Later` 翻页，避免滚动条和内存无限增长
 
 ## 启动
 
@@ -27,6 +28,9 @@ uv sync
 uv run kimix-tui
 uv run kimix-tui --work-dir C:\path\to\project
 ```
+
+开发环境通过 editable source 使用相邻的 `../Kimi-CLI-X` 工作区；`kimix`、
+`kimi_agent_sdk`、`kimi_cli`、`kosong` 和 `kaos` 都直接加载该工作区源码。
 
 不传 `--session` 时会在主页按更新时间倒序列出当前工作目录下的非空历史会话；高亮或单击会话可查看大小、存储格式、更新时间、待办等详情，按 Enter 或点击 **Open session** 进入。传入 `--session` 则跳过首次主页，直接进入该会话；从会话返回后仍会打开主页：
 
@@ -69,7 +73,10 @@ uv run kimix-tui --config=C:\path\to\provider.json
 | `q` / `Esc` | 主页退出进程 |
 | `Esc` | 聊天中关闭当前会话并回到主页 |
 | `Ctrl+G` | 取消当前生成 |
+| `Ctrl+↑` | 加载更早聊天记录 |
+| `Ctrl+End` | 跳到最新聊天记录 |
 | `F2` | 聚焦输入框 |
+| `F3` | 聚焦历史 turn 跳转框 |
 | `F4` | 打开 LLM Settings |
 | `a` | 审批弹窗中批准一次 |
 | `s` | 审批弹窗中对本会话批准 |
@@ -78,11 +85,18 @@ uv run kimix-tui --config=C:\path\to\provider.json
 ## 原型边界
 
 - 输入框目前是单行。
-- 进入已有会话时回放该会话的压缩历史（可往上滚动查看）；公开 SDK 仍无通用 history list 接口。
+- 进入已有会话时通过 `wire.jsonl` 的 turn 偏移索引分页回放历史；公开 SDK 仍无通用 history list 接口。
 - 未实现文件 diff 专用视图和多 Agent 视图。
 
 ## 开发验证
 
 ```powershell
 uv run pytest -q
+```
+
+大文本会话的渲染压测（不会创建 1-2 GiB 的持久文件，按批次生成等效文本量）：
+
+```powershell
+uv run python scripts/benchmark_transcript.py --gigabytes 1
+uv run python scripts/benchmark_transcript.py --gigabytes 2
 ```

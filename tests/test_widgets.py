@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 from textual.app import App, ComposeResult
 
-from kimix_tui.rendering import DISPLAY_CHAR_LIMIT
 from kimix_tui.widgets import Transcript
 
 
@@ -23,6 +22,11 @@ class PaddedTranscriptHarness(App[None]):
 
     def compose(self) -> ComposeResult:
         yield Transcript(id="transcript")
+
+
+class BoundedTranscriptHarness(App[None]):
+    def compose(self) -> ComposeResult:
+        yield Transcript(id="transcript", max_chars=32)
 
 
 def _visible_text(transcript: Transcript) -> str:
@@ -52,16 +56,47 @@ async def test_transcript_keeps_records_for_scrollback() -> None:
 
 
 @pytest.mark.asyncio
-async def test_transcript_stream_stops_growing_past_display_limit() -> None:
+async def test_transcript_keeps_full_dialogue_text_when_streaming() -> None:
     app = TranscriptHarness()
     async with app.run_test(size=(80, 24)):
         transcript = app.query_one(Transcript)
-        await transcript.append_stream("assistant", "a" * 100)
-        await transcript.append_stream("assistant", "b" * (DISPLAY_CHAR_LIMIT + 500))
+        first = "a" * 100
+        second = "b" * 4_500
+        await transcript.append_stream("assistant", first)
+        await transcript.append_stream("assistant", second)
 
         assert len(transcript.records) == 1
-        assert len(transcript.records[0].text) < DISPLAY_CHAR_LIMIT + 80
+        assert transcript.records[0].text == first + second
+
+        user_text = "question " + ("x" * 4_500)
+        await transcript.append_block("user", user_text)
+        assert transcript.records[-1].text == user_text
+
+
+@pytest.mark.asyncio
+async def test_transcript_still_bounds_auxiliary_records() -> None:
+    app = TranscriptHarness()
+    async with app.run_test(size=(80, 24)):
+        transcript = app.query_one(Transcript)
+        await transcript.append_block("tool", "x" * 4_500)
+
         assert "truncated" in transcript.records[0].text
+
+
+@pytest.mark.asyncio
+async def test_transcript_paints_records_lazily_and_bounds_memory() -> None:
+    app = BoundedTranscriptHarness()
+    async with app.run_test(size=(80, 24)):
+        transcript = app.query_one(Transcript)
+        await transcript.append_blocks(
+            [("user", f"message-{index}-{'x' * 20}") for index in range(10)]
+        )
+
+        assert transcript.omitted_records > 0
+        assert len(transcript._strip_cache) == 0
+        transcript.render_line(0)
+        assert len(transcript._strip_cache) == 1
+        assert len(transcript._strip_cache) <= 32
 
 
 @pytest.mark.asyncio
@@ -82,7 +117,18 @@ async def test_transcript_append_blocks_keeps_full_history() -> None:
 
 
 @pytest.mark.asyncio
-async def test_clicking_response_copies_only_that_message() -> None:
+async def test_non_dialogue_records_take_one_transcript_line() -> None:
+    app = TranscriptHarness()
+    async with app.run_test(size=(40, 24)):
+        transcript = app.query_one(Transcript)
+        await transcript.append_block("tool", "Read file\nPath: example.py\nArguments: {}")
+
+        assert transcript._record_line_counts == [1]
+        assert "▸ Tool  Read file" in transcript.render_line(0).text
+
+
+@pytest.mark.asyncio
+async def test_only_explicit_copy_action_copies_dialogue_message() -> None:
     app = TranscriptHarness()
     async with app.run_test(size=(80, 24)) as pilot:
         transcript = app.query_one(Transcript)
@@ -99,19 +145,23 @@ async def test_clicking_response_copies_only_that_message() -> None:
         )
         await pilot.pause()
 
-        first_response_line = sum(transcript._record_line_counts[:2]) + 1
-        await pilot.click(transcript, offset=(4, first_response_line))
+        app.copy_to_clipboard("unchanged")
+        first_response_header = sum(transcript._record_line_counts[:2])
+        await pilot.click(transcript, offset=(4, first_response_header + 1))
+        assert app._clipboard == "unchanged"
 
+        copy_x = transcript._content_width() - 3
+        await pilot.click(transcript, offset=(copy_x, first_response_header))
         assert app._clipboard == "First answer"
 
         tool_line = sum(transcript._record_line_counts[:3])
-        await pilot.click(transcript, offset=(4, tool_line))
+        await pilot.click(transcript, offset=(4, tool_line), button=3)
 
         assert app._clipboard == "Read file\nPath: example.py"
 
 
 @pytest.mark.asyncio
-async def test_clicking_leading_system_record_copies_only_that_record() -> None:
+async def test_clicking_copy_action_on_system_record_copies_only_that_record() -> None:
     app = TranscriptHarness()
     async with app.run_test(size=(80, 24)) as pilot:
         transcript = app.query_one(Transcript)
@@ -124,13 +174,38 @@ async def test_clicking_leading_system_record_copies_only_that_record() -> None:
         )
         await pilot.pause()
 
-        await pilot.click(transcript, offset=(4, 0))
+        await pilot.click(transcript, offset=(transcript._content_width() - 3, 0))
 
         assert app._clipboard == "Session: demo"
 
 
 @pytest.mark.asyncio
-async def test_clicking_scrolled_history_uses_the_visible_record() -> None:
+async def test_auxiliary_record_expands_collapses_and_copies_from_action() -> None:
+    app = TranscriptHarness()
+    async with app.run_test(size=(40, 24)) as pilot:
+        transcript = app.query_one(Transcript)
+        await transcript.append_block("tool", "Read file\nPath: example.py")
+
+        await pilot.click(transcript, offset=(8, 0))
+        assert transcript.records[0].expanded is True
+        assert transcript._record_line_counts[0] > 1
+        assert "Path: example.py" in _visible_text(transcript)
+
+        app.copy_to_clipboard("unchanged")
+        await pilot.click(transcript, offset=(8, 1))
+        assert app._clipboard == "unchanged"
+        assert transcript.records[0].expanded is True
+
+        await pilot.click(transcript, offset=(transcript._content_width() - 3, 0))
+        assert app._clipboard == "Read file\nPath: example.py"
+
+        await pilot.click(transcript, offset=(8, 0))
+        assert transcript.records[0].expanded is False
+        assert transcript._record_line_counts == [1]
+
+
+@pytest.mark.asyncio
+async def test_clicking_scrolled_message_body_does_not_copy() -> None:
     app = PaddedTranscriptHarness()
     async with app.run_test(size=(80, 12)) as pilot:
         transcript = app.query_one(Transcript)
@@ -155,9 +230,10 @@ async def test_clicking_scrolled_history_uses_the_visible_record() -> None:
             force=True,
         )
         await pilot.pause()
+        app.copy_to_clipboard("unchanged")
         await pilot.click(transcript, offset=(3, 1))
 
-        assert app._clipboard == "Question 5"
+        assert app._clipboard == "unchanged"
 
 
 @pytest.mark.asyncio
@@ -217,3 +293,53 @@ async def test_transcript_stays_put_when_user_scrolls_up() -> None:
         visible = _visible_text(transcript)
         assert "turn-000" in visible
         assert "new-after-scroll" not in visible
+
+
+@pytest.mark.asyncio
+async def test_prepend_history_preserves_the_visible_scroll_anchor() -> None:
+    app = PaddedTranscriptHarness()
+    async with app.run_test(size=(80, 12)) as pilot:
+        transcript = app.query_one(Transcript)
+        await transcript.append_blocks(
+            [("user", f"current-{index:02d}") for index in range(30)]
+        )
+        transcript.mark_history_window(0, len(transcript.records))
+        transcript.scroll_to(y=24, animate=False, immediate=True, force=True)
+        await pilot.pause()
+        old_scroll = transcript.scroll_offset.y
+
+        added_lines = await transcript.prepend_history_blocks(
+            [("user", "older-00"), ("user", "older-01")]
+        )
+        await pilot.pause()
+
+        assert added_lines == 6
+        assert transcript.scroll_offset.y == old_scroll + added_lines
+        assert [record.text for record in transcript.records[:2]] == [
+            "older-00",
+            "older-01",
+        ]
+        assert "current-08" in _visible_text(transcript)
+
+
+@pytest.mark.asyncio
+async def test_replacing_history_window_keeps_live_rows() -> None:
+    app = TranscriptHarness()
+    async with app.run_test(size=(80, 24)):
+        transcript = app.query_one(Transcript)
+        await transcript.append_blocks(
+            [("system", "Session: demo"), ("user", "old-history"), ("assistant", "live")]
+        )
+        transcript.mark_history_window(1, 2)
+
+        await transcript.replace_history_blocks(
+            [("user", "page-history"), ("assistant", "page-reply")]
+        )
+
+        assert [(record.kind, record.text) for record in transcript.records] == [
+            ("system", "Session: demo"),
+            ("user", "page-history"),
+            ("assistant", "page-reply"),
+            ("assistant", "live"),
+        ]
+        assert transcript.history_window == (1, 3)

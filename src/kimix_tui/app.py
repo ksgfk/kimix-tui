@@ -29,7 +29,7 @@ class KimixTuiApp(App[None]):
     """Route between full-screen application states."""
 
     TITLE = "Kimix TUI"
-    SUB_TITLE = "public SDK prototype"
+    SUB_TITLE = "Kimix Worker"
 
     def __init__(
         self,
