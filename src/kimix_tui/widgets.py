@@ -5,12 +5,13 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from textual import events
 from textual.geometry import Size
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
 
 from kimix_tui.rendering import bounded_concat, truncate_display
-from kimix_tui.transcript_paint import render_record_strips, sanitize_strip
+from kimix_tui.transcript_paint import record_label, render_record_strips, sanitize_strip
 
 
 @dataclass(slots=True)
@@ -35,6 +36,7 @@ class Transcript(ScrollView, can_focus=True):
         scrollbar-size: 1 1;
     }
     """
+    ALLOW_SELECT = False
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         super().__init__(*args, **kwargs)
@@ -147,6 +149,31 @@ class Transcript(ScrollView, can_focus=True):
             style,
         )
 
+    def _record_index_at_line(self, line: int) -> int | None:
+        if line < 0:
+            return None
+        first_line = 0
+        for index, line_count in enumerate(self._record_line_counts):
+            if line < first_line + line_count:
+                return index
+            first_line += line_count
+        return None
+
+    def on_click(self, event: events.Click) -> None:
+        if event.widget is not self or event.button != 1:
+            return
+        content_offset = event.get_content_offset(self)
+        if content_offset is None:
+            return
+        record_index = self._record_index_at_line(
+            self.scroll_offset.y + content_offset.y
+        )
+        if record_index is None:
+            return
+        record = self.records[record_index]
+        self.app.copy_to_clipboard(record.text)
+        self.notify(f"{record_label(record.kind)} message copied")
+
     async def append_block(self, kind: str, text: str) -> None:
         self.finish_stream()
         self._append_record(TranscriptRecord(kind, truncate_display(text)))
@@ -160,7 +187,13 @@ class Transcript(ScrollView, can_focus=True):
         self.refresh()
         self._maybe_scroll_end()
 
-    async def append_stream(self, kind: str, fragment: str) -> None:
+    async def append_stream(
+        self,
+        kind: str,
+        fragment: str,
+        *,
+        replace: bool = False,
+    ) -> None:
         if not fragment:
             return
         if self._stream_kind != kind or self._stream_record is None:
@@ -170,7 +203,11 @@ class Transcript(ScrollView, can_focus=True):
             self._stream_kind = kind
             self._stream_record = record
         else:
-            clipped = bounded_concat(self._stream_record.text, fragment)
+            clipped = (
+                truncate_display(fragment)
+                if replace
+                else bounded_concat(self._stream_record.text, fragment)
+            )
             if clipped == self._stream_record.text:
                 return
             self._stream_record.text = clipped

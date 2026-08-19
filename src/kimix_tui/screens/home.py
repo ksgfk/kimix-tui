@@ -12,6 +12,7 @@ from textual import events, on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
 from textual.screen import ModalScreen, Screen
 from textual.widgets import Button, Input, Label, ListItem, ListView, Static
 
@@ -38,6 +39,29 @@ class SessionChoice:
     session_id: str | None = None
 
 
+class SessionCheck(Static):
+    """Clickable selection indicator for a session row."""
+
+    class Toggled(Message):
+        """Request that a session's batch-selection state be toggled."""
+
+        def __init__(self, session_id: str) -> None:
+            super().__init__()
+            self.session_id = session_id
+
+    def __init__(self, session_id: str, *, selected: bool) -> None:
+        super().__init__(
+            "[x]" if selected else "[ ]",
+            classes="session-check",
+            markup=False,
+        )
+        self.session_id = session_id
+
+    def on_click(self, event: events.Click) -> None:
+        event.stop()
+        self.post_message(self.Toggled(self.session_id))
+
+
 class SessionListItem(ListItem):
     """Compact selectable row for a saved session."""
 
@@ -48,10 +72,9 @@ class SessionListItem(ListItem):
 
     def compose(self) -> ComposeResult:
         with Horizontal(classes="session-row-main"):
-            yield Static(
-                "[x]" if self.selected else "[ ]",
-                classes="session-check",
-                markup=False,
+            yield SessionCheck(
+                self.summary.id,
+                selected=self.selected,
             )
             yield Label(self.summary.title, markup=False, classes="session-title")
         yield Static(
@@ -67,7 +90,7 @@ class SessionListItem(ListItem):
     def set_selected(self, selected: bool) -> None:
         self.selected = selected
         self.set_class(selected, "-selected")
-        self.query_one(".session-check", Static).update("[x]" if selected else "[ ]")
+        self.query_one(SessionCheck).update("[x]" if selected else "[ ]")
 
 
 class SessionListView(ListView):
@@ -252,7 +275,7 @@ class SessionDetails(VerticalScroll):
         self.query_one("#detail-id", Static).update(summary.id)
         self.query_one("#detail-path", Static).update(str(self._work_dir))
         self.query_one("#detail-metadata", Vertical).display = True
-        self.query_one("#open-session", Button).disabled = not self._configuration_available
+        self.query_one("#open-session", Button).disabled = False
         self.query_one("#configure-session", Button).disabled = False
         self.query_one("#toggle-session", Button).disabled = False
 
@@ -609,7 +632,6 @@ class HomeScreen(Screen[SessionChoice]):
                     "+ New session",
                     id="start-new-session",
                     variant="primary",
-                    disabled=not default_available,
                 )
                 yield Button("Settings", id="open-settings")
         with Horizontal(id="home-workspace"):
@@ -753,6 +775,20 @@ class HomeScreen(Screen[SessionChoice]):
     def press_toggle_session(self) -> None:
         self.action_toggle_selected()
 
+    @on(SessionCheck.Toggled)
+    def toggle_session_check(self, event: SessionCheck.Toggled) -> None:
+        event.stop()
+        item = next(
+            (
+                item
+                for item in self.query(SessionListItem)
+                if item.summary.id == event.session_id
+            ),
+            None,
+        )
+        if item is not None:
+            self._toggle_session_item(item)
+
     @on(Button.Pressed, "#select-shown")
     def press_select_shown(self) -> None:
         items = list(self.query(SessionListItem))
@@ -781,7 +817,7 @@ class HomeScreen(Screen[SessionChoice]):
 
     def open_session(self, summary: SessionSummary) -> None:
         if not self.query_one(SessionDetails).configuration_available:
-            self.post_message(OpenLLMSettings(summary.id))
+            self._request_llm_configuration(summary.id)
             return
         self.dismiss(SessionChoice(action="resume", session_id=summary.id))
 
@@ -792,7 +828,6 @@ class HomeScreen(Screen[SessionChoice]):
         self.query_one("#home-model", Static).update(
             f"New sessions · {default_config.label}{status}"
         )
-        self.query_one("#start-new-session", Button).disabled = not available
         self.query_one(SessionDetails).refresh_configuration(default_config)
 
     def action_focus_search(self) -> None:
@@ -802,6 +837,9 @@ class HomeScreen(Screen[SessionChoice]):
         item = self.query_one("#session-list", ListView).highlighted_child
         if not isinstance(item, SessionListItem):
             return
+        self._toggle_session_item(item)
+
+    def _toggle_session_item(self, item: SessionListItem) -> None:
         session_id = item.summary.id
         if session_id in self._selected_ids:
             self._selected_ids.remove(session_id)
@@ -839,9 +877,17 @@ class HomeScreen(Screen[SessionChoice]):
 
     def action_new_session(self) -> None:
         if not config_file_available(self._default_config):
-            self.post_message(OpenLLMSettings())
+            self._request_llm_configuration()
             return
         self.dismiss(SessionChoice(action="new"))
+
+    def _request_llm_configuration(self, session_id: str | None = None) -> None:
+        self.notify(
+            "Select a valid LLM configuration to continue.",
+            title="LLM configuration required",
+            severity="warning",
+        )
+        self.post_message(OpenLLMSettings(session_id))
 
     def action_settings(self) -> None:
         self.post_message(OpenLLMSettings())

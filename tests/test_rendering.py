@@ -1,17 +1,33 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 from kimi_agent_sdk import (
+    BriefDisplayBlock,
     CompactionEnd,
+    DiffDisplayBlock,
     StatusUpdate,
     StepBegin,
+    SubagentEvent,
     TextPart,
     ThinkPart,
+    TodoDisplayBlock,
+    TodoDisplayItem,
+    TokenUsage,
     ToolCall,
-    ToolOk,
+    ToolCallPart,
     ToolResult,
+    ToolReturnValue,
 )
 
-from kimix_tui.rendering import bounded_concat, format_status, render_wire_message, truncate_display
+from kimix_tui.rendering import (
+    RenderState,
+    bounded_concat,
+    format_display_blocks,
+    format_status,
+    render_wire_message,
+    truncate_display,
+)
 
 
 def test_text_and_thinking_are_streaming_events() -> None:
@@ -38,19 +54,83 @@ def test_tool_call_pretty_prints_json_arguments() -> None:
 
     assert event is not None
     assert event.kind == "tool"
+    assert event.starts_stream is True
+    assert "Call ID: call-1" in event.text
     assert '"path": "a.py"' in event.text
 
 
-def test_tool_result_uses_public_brief_display() -> None:
-    event = render_wire_message(
+def test_tool_stream_and_result_keep_all_public_details() -> None:
+    state = RenderState()
+    call = render_wire_message(
+        ToolCall(
+            id="call-1",
+            function=ToolCall.FunctionBody(name="read", arguments=""),
+            extras={"provider": "test"},
+        ),
+        state=state,
+    )
+    part = render_wire_message(ToolCallPart(arguments_part='{"path":"a.py"}'), state=state)
+    result = render_wire_message(
         ToolResult(
             tool_call_id="call-1",
-            return_value=ToolOk(output="long internal output", brief="read a.py"),
-        )
+            return_value=ToolReturnValue(
+                is_error=False,
+                output="long internal output",
+                message="success",
+                display=[BriefDisplayBlock(text="read a.py")],
+                extras={"bytes": 20},
+            ),
+        ),
+        state=state,
     )
 
-    assert event is not None
-    assert (event.kind, event.text) == ("tool_result", "read a.py")
+    assert call is not None and "provider" in call.text
+    assert part is not None and part.streaming is True
+    assert part.replaces_stream is True
+    assert "read\nCall ID: call-1" in part.text
+    assert '"path": "a.py"' in part.text
+    assert result is not None and result.kind == "tool_result"
+    for detail in (
+        "read · succeeded",
+        "Call ID: call-1",
+        "Message:\nsuccess",
+        "Display:\nread a.py",
+        "Output:\nlong internal output",
+        '"bytes": 20',
+    ):
+        assert detail in result.text
+
+
+def test_native_display_blocks_include_diff_and_todo_details() -> None:
+    text = format_display_blocks(
+        [
+            BriefDisplayBlock(text="Updated files"),
+            DiffDisplayBlock(
+                path="a.py",
+                old_text="old",
+                new_text="new",
+                old_start=4,
+                new_start=5,
+            ),
+            TodoDisplayBlock(
+                items=[
+                    TodoDisplayItem(title="Implement", status="in_progress", notes="now"),
+                    TodoDisplayItem(title="Verify", status="done", depth=1),
+                ]
+            ),
+        ]
+    )
+
+    for detail in (
+        "Updated files",
+        "Diff: a.py",
+        "@@ -4 +5 @@",
+        "- old",
+        "+ new",
+        "[>] Implement — now",
+        "  [x] Verify",
+    ):
+        assert detail in text
 
 
 def test_status_and_compaction_are_human_readable() -> None:
@@ -65,6 +145,57 @@ def test_status_and_compaction_are_human_readable() -> None:
     assert format_status(status) == "context 1,000/10,000 · 10.0%"
     assert rendered is not None and rendered.kind == "status"
     assert compacted is not None and "500" in compacted.text
+
+
+def test_status_includes_tokens_message_and_mcp_details() -> None:
+    status = SimpleNamespace(
+        context_tokens=2_000,
+        max_context_tokens=20_000,
+        context_usage=0.1,
+        token_usage=TokenUsage(
+            input_other=100,
+            input_cache_read=800,
+            input_cache_creation=50,
+            output=75,
+        ),
+        message_id="msg-1",
+        mcp_status=SimpleNamespace(
+            loading=False,
+            connected=1,
+            total=2,
+            tools=8,
+            servers=(SimpleNamespace(name="github", status="connected"),),
+        ),
+    )
+
+    text = format_status(status)
+
+    assert "context 2,000/20,000" in text
+    assert "tokens in 950 (new 100, cache read 800, cache write 50)" in text
+    assert "out 75" in text
+    assert "message msg-1" in text
+    assert "MCP 1/2 ready, 8 tools [github:connected]" in text
+
+
+def test_subagent_streams_do_not_merge_with_main_assistant() -> None:
+    state = RenderState()
+    main_before = render_wire_message(TextPart(text="main"), state=state)
+    child_first = render_wire_message(
+        SubagentEvent(agent_id="child-1", subagent_type="explore", event=TextPart(text="one")),
+        state=state,
+    )
+    child_second = render_wire_message(
+        SubagentEvent(agent_id="child-1", subagent_type="explore", event=TextPart(text="two")),
+        state=state,
+    )
+    main_after = render_wire_message(TextPart(text="back"), state=state)
+
+    assert main_before is not None and main_before.starts_stream is True
+    assert child_first is not None and child_first.starts_stream is True
+    assert child_first.text.startswith("Subagent explore · child-1\n")
+    assert child_second is not None and child_second.starts_stream is False
+    assert child_second.text == "two"
+    assert main_after is not None and main_after.starts_stream is True
 
 
 def test_step_event_is_visible() -> None:

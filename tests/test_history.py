@@ -3,7 +3,18 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from kimi_agent_sdk import StepInterrupted, TextPart, ThinkPart, TurnBegin, TurnEnd
+from kimi_agent_sdk import (
+    BriefDisplayBlock,
+    StepInterrupted,
+    TextPart,
+    ThinkPart,
+    ToolCall,
+    ToolCallPart,
+    ToolResult,
+    ToolReturnValue,
+    TurnBegin,
+    TurnEnd,
+)
 
 from kimix_tui.history import (
     HistoryAccumulator,
@@ -108,6 +119,37 @@ async def test_load_session_history_keeps_all_turns_by_default(tmp_path: Path) -
 
 def test_unknown_objects_are_ignored() -> None:
     assert blocks_from_wire_messages([SimpleNamespace(noise=True), TurnEnd()]) == []
+
+
+def test_history_keeps_streamed_tool_arguments_and_detailed_result() -> None:
+    blocks = blocks_from_wire_messages(
+        [
+            TurnBegin(user_input="read it"),
+            ToolCall(
+                id="call-1",
+                function=ToolCall.FunctionBody(name="read", arguments=""),
+            ),
+            ToolCallPart(arguments_part='{"path":'),
+            ToolCallPart(arguments_part='"a.py"}'),
+            ToolResult(
+                tool_call_id="call-1",
+                return_value=ToolReturnValue(
+                    is_error=False,
+                    output="contents",
+                    message="success",
+                    display=[BriefDisplayBlock(text="read a.py")],
+                    extras=None,
+                ),
+            ),
+        ]
+    )
+
+    assert [block.kind for block in blocks] == ["user", "tool", "tool_result"]
+    assert "Arguments:" in blocks[1].text
+    assert '"path": "a.py"' in blocks[1].text
+    assert "read · succeeded" in blocks[2].text
+    assert "Display:\nread a.py" in blocks[2].text
+    assert "Output:\ncontents" in blocks[2].text
 
 
 def test_accumulator_discards_turns_outside_the_window() -> None:

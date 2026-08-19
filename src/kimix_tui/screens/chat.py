@@ -15,7 +15,7 @@ from textual.widgets import Footer, Header, Input, Static
 
 from kimix_tui.backend import SdkSession, SessionOptions, create_sdk_session
 from kimix_tui.history import HistoryLoader, load_session_history
-from kimix_tui.rendering import format_status, render_wire_message
+from kimix_tui.rendering import RenderEvent, RenderState, format_status, render_wire_message
 from kimix_tui.screens.requests import ApprovalScreen, QuestionScreen
 from kimix_tui.screens.settings import OpenLLMSettings
 from kimix_tui.widgets import Transcript
@@ -34,10 +34,12 @@ class ChatScreen(Screen[None]):
     }
 
     #status {
-        height: 1;
+        height: auto;
+        max-height: 3;
         padding: 0 1;
         color: $text-muted;
         background: $panel;
+        text-wrap: wrap;
     }
 
     #transcript {
@@ -56,7 +58,7 @@ class ChatScreen(Screen[None]):
 
     .thinking { color: $text-muted; }
     .user { border-left: thick $secondary; }
-    .tool { border-left: thick $accent; background: $boost; }
+    .tool { border-left: thick $accent; }
     .tool_result { border-left: thick $primary; }
     .error { border-left: thick $error; }
     .approval { border-left: thick $warning; }
@@ -93,12 +95,14 @@ class ChatScreen(Screen[None]):
         self._chat_epoch = 0
         self._leaving = False
         self._pending_config_label: str | None = None
+        self._render_state = RenderState()
+        self._last_wire_status: str | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
         yield Static("connecting…", id="status")
         yield Transcript(id="transcript")
-        yield Input(placeholder="Ask Kimi, or type /help", id="prompt", disabled=True)
+        yield Input(placeholder="Ask AI, or type /help", id="prompt", disabled=True)
         yield Footer()
 
     def on_mount(self) -> None:
@@ -185,7 +189,8 @@ class ChatScreen(Screen[None]):
         self._pending_config_label = label
         session = self._session
         if session is not None:
-            self._set_status(f"session {session.id} · {format_status(session.status)}")
+            detail = self._last_wire_status or format_status(session.status)
+            self._set_status(f"session {session.id} · {detail}")
 
     def _set_input_enabled(self, enabled: bool) -> None:
         prompt = self.query_one("#prompt", Input)
@@ -218,21 +223,14 @@ class ChatScreen(Screen[None]):
                 if self._session is not session:
                     return
                 if isinstance(message, ApprovalRequest):
+                    await self._render_message(message)
                     await self._handle_approval(message)
                     continue
                 if is_request(message):
+                    await self._render_message(message)
                     await self._handle_other_request(message)
                     continue
-
-                rendered = render_wire_message(message)
-                if rendered is None:
-                    continue
-                if rendered.kind == "status":
-                    self._set_status(f"session {session.id} · {rendered.text}")
-                elif rendered.streaming:
-                    await self.transcript.append_stream(rendered.kind, rendered.text)
-                else:
-                    await self.transcript.append_block(rendered.kind, rendered.text)
+                await self._render_message(message)
         except RunCancelled:
             if self._session is session:
                 await self.transcript.append_block("system", "Generation cancelled")
@@ -244,18 +242,43 @@ class ChatScreen(Screen[None]):
             self._busy = False
             if self._session is session:
                 self._set_input_enabled(True)
-                self._set_status(f"session {session.id} · {format_status(session.status)}")
+                detail = self._last_wire_status or format_status(session.status)
+                self._set_status(f"session {session.id} · {detail}")
 
     async def _handle_approval(self, request: ApprovalRequest) -> None:
         self.transcript.finish_stream()
-        await self.transcript.append_block(
-            "approval",
-            f"{request.sender}: {request.action}\n{request.description}",
-        )
         decision = await self.app.push_screen_wait(
             ApprovalScreen(f"Approve {request.action}?", request.description)
         )
         request.resolve(decision)  # type: ignore[arg-type]
+        await self.transcript.append_block(
+            "system",
+            f"Approval decision: {decision}\nRequest ID: {request.id}",
+        )
+
+    async def _render_message(self, message: object) -> None:
+        rendered = render_wire_message(message, state=self._render_state)
+        if rendered is None:
+            return
+        await self._append_rendered(rendered)
+
+    async def _append_rendered(self, rendered: RenderEvent) -> None:
+        if rendered.kind == "status":
+            session = self._session
+            prefix = f"session {session.id} · " if session is not None else ""
+            self._last_wire_status = rendered.text
+            self._set_status(prefix + rendered.text)
+            return
+        if rendered.starts_stream:
+            self.transcript.finish_stream()
+        if rendered.streaming:
+            await self.transcript.append_stream(
+                rendered.kind,
+                rendered.text,
+                replace=rendered.replaces_stream,
+            )
+        else:
+            await self.transcript.append_block(rendered.kind, rendered.text)
 
     async def _handle_other_request(self, request: object) -> None:
         """Handle request variants without importing private SDK modules."""
@@ -269,9 +292,17 @@ class ChatScreen(Screen[None]):
                     set_exception = getattr(request, "set_exception", None)
                     if callable(set_exception):
                         set_exception(RuntimeError("Question cancelled by user"))
+                    await self.transcript.append_block(
+                        "error",
+                        f"Question cancelled\nRequest ID: {getattr(request, 'id', '')}",
+                    )
                     return
                 answers[str(getattr(question, "question", "Question"))] = answer
             self._resolve_request(request, answers)
+            rendered_answers = "\n".join(
+                f"{question}: {answer}" for question, answer in answers.items()
+            )
+            await self.transcript.append_block("system", f"Question response\n{rendered_answers}")
             return
 
         if request_name == "HookRequest":
@@ -283,16 +314,19 @@ class ChatScreen(Screen[None]):
             )
             action = "allow" if decision != "reject" else "block"
             self._resolve_request(request, action, "")
+            await self.transcript.append_block(
+                "system" if action == "allow" else "error",
+                f"Hook decision: {action}\nRequest ID: {getattr(request, 'id', '')}",
+            )
             return
 
         if request_name == "ToolCallRequest":
-            self._resolve_request(
-                request,
-                ToolError(
-                    message="External client-side tools are not supported by this TUI prototype",
-                    brief="Unsupported external tool",
-                ),
+            error = ToolError(
+                message="External client-side tools are not supported by this TUI prototype",
+                brief="Unsupported external tool",
             )
+            self._resolve_request(request, error)
+            await self.transcript.append_block("error", error.message)
             return
 
         await self.transcript.append_block("error", f"Unsupported SDK request: {request_name}")
@@ -322,7 +356,9 @@ class ChatScreen(Screen[None]):
             )
             return
         if name == "/status":
-            await self.transcript.append_block("system", format_status(session.status))
+            await self.transcript.append_block(
+                "system", self._last_wire_status or format_status(session.status)
+            )
             return
 
         self._busy = True
@@ -344,7 +380,8 @@ class ChatScreen(Screen[None]):
             self._busy = False
             if self._session is session:
                 self._set_input_enabled(True)
-                self._set_status(f"session {session.id} · {format_status(session.status)}")
+                detail = self._last_wire_status or format_status(session.status)
+                self._set_status(f"session {session.id} · {detail}")
 
     def action_cancel_prompt(self) -> None:
         if self._session is not None and self._busy:

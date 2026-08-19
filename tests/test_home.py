@@ -15,6 +15,7 @@ from kimix_tui.screens.chat import ChatScreen
 from kimix_tui.screens.home import (
     DeleteSessionsScreen,
     HomeScreen,
+    SessionCheck,
     SessionDetails,
     SessionListItem,
 )
@@ -252,6 +253,37 @@ async def test_click_previews_session_before_opening(tmp_path: Path) -> None:
 
         assert opened[0].session_id == "sess-2"
         assert isinstance(app.screen, ChatScreen)
+
+
+@pytest.mark.asyncio
+async def test_click_session_check_toggles_selection(tmp_path: Path) -> None:
+    app = KimixTuiApp(
+        SessionOptions(tmp_path),
+        session_loader=_history_loader,
+        config_store=_config_store(tmp_path),
+    )
+    async with app.run_test(size=(100, 35)) as pilot:
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        home = app.screen
+        assert isinstance(home, HomeScreen)
+        items = list(home.query(SessionListItem))
+        second_check = items[1].query_one(SessionCheck)
+
+        await pilot.click(second_check)
+        await pilot.pause()
+
+        assert items[1].selected is True
+        assert str(second_check.content) == "[x]"
+        assert str(home.query_one("#selection-count", Static).content) == "1 selected"
+        assert home.query_one(SessionDetails).summary == items[0].summary
+
+        await pilot.click(second_check)
+        await pilot.pause()
+
+        assert items[1].selected is False
+        assert str(second_check.content) == "[ ]"
+        assert str(home.query_one("#selection-count", Static).content) == "0 selected"
 
 
 @pytest.mark.asyncio

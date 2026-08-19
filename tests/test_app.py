@@ -6,8 +6,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from kimi_agent_sdk import ApprovalRequest, TextPart, TurnEnd
-from textual.widgets import Input
+from kimi_agent_sdk import (
+    ApprovalRequest,
+    BriefDisplayBlock,
+    StatusUpdate,
+    TextPart,
+    TokenUsage,
+    ToolCall,
+    ToolCallPart,
+    ToolResult,
+    ToolReturnValue,
+    TurnEnd,
+)
+from textual.widgets import Input, Static
 
 from kimix_tui.app import KimixTuiApp
 from kimix_tui.backend import SessionOptions
@@ -105,6 +116,103 @@ async def test_keyboard_submit_streams_into_transcript(tmp_path: Path) -> None:
         assert ("assistant", "hello world") in records
 
     assert session.closed is True
+
+
+@pytest.mark.asyncio
+async def test_chat_shows_streamed_tool_call_and_detailed_result(tmp_path: Path) -> None:
+    session = FakeSession(
+        [
+            ToolCall(
+                id="call-1",
+                function=ToolCall.FunctionBody(name="read", arguments=""),
+            ),
+            ToolCallPart(arguments_part='{"path":'),
+            ToolCallPart(arguments_part='"a.py"}'),
+            ToolResult(
+                tool_call_id="call-1",
+                return_value=ToolReturnValue(
+                    is_error=False,
+                    output="file contents",
+                    message="success",
+                    display=[BriefDisplayBlock(text="read a.py")],
+                    extras=None,
+                ),
+            ),
+            TurnEnd(),
+        ]
+    )
+
+    async def factory(_options: SessionOptions) -> FakeSession:
+        return session
+
+    app = KimixTuiApp(
+        SessionOptions(tmp_path, session_id="fake-session"),
+        session_factory=factory,
+        config_store=_config_store(tmp_path),
+    )
+    async with app.run_test(size=(100, 35)) as pilot:
+        await app.workers.wait_for_complete()
+        chat = app.screen
+        assert isinstance(chat, ChatScreen)
+        chat.query_one("#prompt", Input).focus()
+        await pilot.press("g", "o", "enter")
+        await app.workers.wait_for_complete()
+
+        tool = next(record for record in chat.transcript.records if record.kind == "tool")
+        result = next(record for record in chat.transcript.records if record.kind == "tool_result")
+        assert "read\nCall ID: call-1" in tool.text
+        assert "Arguments:" in tool.text
+        assert '"path": "a.py"' in tool.text
+        assert "read · succeeded" in result.text
+        assert "Message:\nsuccess" in result.text
+        assert "Display:\nread a.py" in result.text
+        assert "Output:\nfile contents" in result.text
+
+
+@pytest.mark.asyncio
+async def test_chat_keeps_detailed_status_after_turn_finishes(tmp_path: Path) -> None:
+    session = FakeSession(
+        [
+            StatusUpdate(
+                context_tokens=2_000,
+                max_context_tokens=20_000,
+                context_usage=0.1,
+            ),
+            StatusUpdate(
+                token_usage=TokenUsage(
+                    input_other=100,
+                    input_cache_read=800,
+                    input_cache_creation=50,
+                    output=75,
+                ),
+                message_id="msg-1",
+            ),
+            TurnEnd(),
+        ]
+    )
+
+    async def factory(_options: SessionOptions) -> FakeSession:
+        return session
+
+    app = KimixTuiApp(
+        SessionOptions(tmp_path, session_id="fake-session"),
+        session_factory=factory,
+        config_store=_config_store(tmp_path),
+    )
+    async with app.run_test(size=(100, 35)) as pilot:
+        await app.workers.wait_for_complete()
+        chat = app.screen
+        assert isinstance(chat, ChatScreen)
+        chat.query_one("#prompt", Input).focus()
+        await pilot.press("g", "o", "enter")
+        await app.workers.wait_for_complete()
+
+        status = str(chat.query_one("#status", Static).content)
+        assert "context 2,000/20,000" in status
+        assert "tokens in 950" in status
+        assert "cache read 800" in status
+        assert "out 75" in status
+        assert "message msg-1" in status
 
 
 @pytest.mark.asyncio

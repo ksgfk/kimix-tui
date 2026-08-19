@@ -17,7 +17,7 @@ _BAR = "▎ "
 
 _LABELS: dict[str, tuple[str, str]] = {
     "user": ("You", "bold bright_cyan"),
-    "assistant": ("Kimi", "bold bright_green"),
+    "assistant": ("AI", "bold bright_green"),
     "thinking": ("Think", "italic bright_black"),
     "tool": ("Tool", "bold bright_magenta"),
     "tool_result": ("Result", "bright_blue"),
@@ -43,14 +43,43 @@ _BODY_STYLE: dict[str, str] = {
     "error": "red",
 }
 
-_BG_COLOR: dict[str, str] = {
-    "tool": "grey19",
-}
+
+def record_label(kind: str) -> str:
+    """Return the label shown for a transcript record."""
+
+    return _LABELS.get(kind, (kind.title(), "bold"))[0]
+
+
+def _without_background(style: Style) -> Style:
+    if style.bgcolor is None:
+        return style
+    return Style(
+        color=style.color,
+        bold=style.bold,
+        dim=style.dim,
+        italic=style.italic,
+        underline=style.underline,
+        blink=style.blink,
+        blink2=style.blink2,
+        reverse=style.reverse,
+        conceal=style.conceal,
+        strike=style.strike,
+        underline2=style.underline2,
+        frame=style.frame,
+        encircle=style.encircle,
+        overline=style.overline,
+        link=style.link,
+        meta=style.meta,
+    )
 
 
 def _fill_none(segments: Iterable[Segment], fallback: Style = _NULL) -> list[Segment]:
     return [
-        Segment(text, style if style is not None else fallback, control)
+        Segment(
+            text,
+            _without_background(style if style is not None else fallback),
+            control,
+        )
         for text, style, control in segments
     ]
 
@@ -65,34 +94,19 @@ def _cell_length(segments: list[Segment]) -> int:
     return sum(cell_len(text) for text, _style, control in segments if not control)
 
 
-def _apply_background(segments: list[Segment], bgcolor: str | None) -> list[Segment]:
-    if not bgcolor:
-        return segments
-    background = Style(bgcolor=bgcolor)
-    return [
-        Segment(text, (style or _NULL) + background, control)
-        for text, style, control in segments
-    ]
-
-
 def _with_bar(
     segments: list[Segment],
     bar_style: Style,
-    *,
-    bgcolor: str | None = None,
 ) -> list[Segment]:
-    prefixed = [Segment(_BAR, bar_style), *_fill_none(segments)]
-    return _apply_background(prefixed, bgcolor)
+    return [Segment(_BAR, bar_style), *_fill_none(segments)]
 
 
 def _strip_from_text(
     line: Text,
     console: Console,
     bar_style: Style,
-    *,
-    bgcolor: str | None = None,
 ) -> Strip:
-    segments = _with_bar(list(line.render(console)), bar_style, bgcolor=bgcolor)
+    segments = _with_bar(list(line.render(console)), bar_style)
     return Strip(segments, _cell_length(segments))
 
 
@@ -114,7 +128,6 @@ def render_record_strips(
     label, label_style = _LABELS.get(kind, (kind.title(), "bold"))
     bar_style = Style.parse(_BAR_COLOR.get(kind, "bright_black"))
     body_style = _BODY_STYLE.get(kind, "")
-    bgcolor = _BG_COLOR.get(kind)
     inner_width = max(8, width - cell_len(_BAR))
     strips: list[Strip] = []
 
@@ -135,9 +148,7 @@ def render_record_strips(
             (text, body_style),
         )
         for wrapped in assembled.wrap(console, inner_width, overflow="fold"):
-            strips.append(
-                _strip_from_text(wrapped, console, bar_style, bgcolor=bgcolor)
-            )
+            strips.append(_strip_from_text(wrapped, console, bar_style))
 
     if not strips:
         strips.append(Strip.blank(width, _NULL))

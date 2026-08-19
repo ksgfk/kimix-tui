@@ -9,11 +9,17 @@ from pathlib import Path
 
 from kaos.path import KaosPath
 
-from kimix_tui.rendering import bounded_concat, render_wire_message, user_input_text
+from kimix_tui.rendering import (
+    RenderState,
+    bounded_concat,
+    render_wire_message,
+    truncate_display,
+    user_input_text,
+)
 
 MAX_HISTORY_TURNS = 4
 MAX_HISTORY_BLOCKS = 32
-_SKIP_RENDER_KINDS = {"status", "system"}
+_SKIP_RENDER_KINDS = {"status"}
 
 HistoryLoader = Callable[[Path, str], Awaitable["SessionHistory"]]
 
@@ -47,6 +53,7 @@ class HistoryAccumulator:
     omitted_turns: int = 0
     _turns: deque[list[HistoryBlock]] = field(default_factory=deque)
     _current: list[HistoryBlock] = field(default_factory=list)
+    _render_state: RenderState = field(default_factory=RenderState)
 
     def feed(self, message: object) -> None:
         name = type(message).__name__
@@ -61,10 +68,15 @@ class HistoryAccumulator:
             if text:
                 self._add("user", text, merge=False)
             return
-        rendered = render_wire_message(message)
+        rendered = render_wire_message(message, state=self._render_state)
         if rendered is None or rendered.kind in _SKIP_RENDER_KINDS:
             return
-        self._add(rendered.kind, rendered.text, merge=rendered.streaming)
+        self._add(
+            rendered.kind,
+            rendered.text,
+            merge=rendered.streaming and not rendered.starts_stream,
+            replace=rendered.replaces_stream,
+        )
 
     def finish(self) -> SessionHistory:
         self._flush_turn()
@@ -73,7 +85,10 @@ class HistoryAccumulator:
             blocks = blocks[-self.max_blocks :]
         return SessionHistory(blocks=blocks, omitted_turns=self.omitted_turns)
 
-    def _add(self, kind: str, text: str, *, merge: bool) -> None:
+    def _add(self, kind: str, text: str, *, merge: bool, replace: bool = False) -> None:
+        if replace and self._current and self._current[-1].kind == kind:
+            self._current[-1] = HistoryBlock(kind, truncate_display(text))
+            return
         if merge and self._current and self._current[-1].kind == kind:
             previous = self._current[-1]
             self._current[-1] = HistoryBlock(kind, bounded_concat(previous.text, text))

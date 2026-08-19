@@ -90,6 +90,32 @@ def config_store(tmp_path: Path) -> LLMConfigStore:
 
 
 @pytest.mark.asyncio
+async def test_new_session_without_llm_shows_configuration_toast(tmp_path: Path) -> None:
+    store = config_store(tmp_path)
+    store.set_default(tmp_path, unavailable_config_reference(tmp_path / "missing.json"))
+    app = KimixTuiApp(
+        SessionOptions(tmp_path),
+        session_loader=session_loader,
+        config_store=store,
+    )
+
+    async with app.run_test(size=(110, 35)) as pilot:
+        await app.workers.wait_for_complete()
+        home = app.screen
+        assert isinstance(home, HomeScreen)
+        assert home.query_one("#start-new-session", Button).disabled is False
+
+        await pilot.click("#start-new-session")
+        await pilot.pause()
+
+        notification = list(app._notifications)[-1]
+        assert notification.title == "LLM configuration required"
+        assert notification.message == "Select a valid LLM configuration to continue."
+        assert notification.severity == "warning"
+        assert isinstance(app.screen, LLMSettingsScreen)
+
+
+@pytest.mark.asyncio
 async def test_session_without_config_continues_to_inherit_default(tmp_path: Path) -> None:
     first, _second = config_files(tmp_path)
     store = config_store(tmp_path)
@@ -346,12 +372,16 @@ async def test_missing_session_config_requires_reconfiguration(tmp_path: Path) -
         await app.workers.wait_for_complete()
         home = app.screen
         assert isinstance(home, HomeScreen)
-        assert home.query_one("#open-session", Button).disabled is True
+        assert home.query_one("#open-session", Button).disabled is False
         assert "missing" in str(home.query_one("#detail-config", Static).content)
 
-        await pilot.press("enter")
+        await pilot.click("#open-session")
         await pilot.pause()
 
+        notification = list(app._notifications)[-1]
+        assert notification.title == "LLM configuration required"
+        assert notification.message == "Select a valid LLM configuration to continue."
+        assert notification.severity == "warning"
         assert isinstance(app.screen, LLMSettingsScreen)
 
 
@@ -383,7 +413,7 @@ async def test_deleted_session_config_keeps_path_until_reconfigured(tmp_path: Pa
         assert str(home.query_one("#detail-llm", Static).content) == "Configuration unavailable"
         assert str(home.query_one("#detail-provider", Static).content) == "Unavailable"
         assert str(first.resolve()) in str(home.query_one("#detail-config", Static).content)
-        assert home.query_one("#open-session", Button).disabled is True
+        assert home.query_one("#open-session", Button).disabled is False
 
         await pilot.press("enter")
         await pilot.pause()

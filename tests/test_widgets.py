@@ -82,6 +82,85 @@ async def test_transcript_append_blocks_keeps_full_history() -> None:
 
 
 @pytest.mark.asyncio
+async def test_clicking_response_copies_only_that_message() -> None:
+    app = TranscriptHarness()
+    async with app.run_test(size=(80, 24)) as pilot:
+        transcript = app.query_one(Transcript)
+        await transcript.append_blocks(
+            [
+                ("system", "Session: demo"),
+                ("user", "First question"),
+                ("assistant", "First answer"),
+                ("tool", "Read file\nPath: example.py"),
+                ("tool_result", "Success\n10 lines"),
+                ("user", "Second question"),
+                ("assistant", "Second answer"),
+            ]
+        )
+        await pilot.pause()
+
+        first_response_line = sum(transcript._record_line_counts[:2]) + 1
+        await pilot.click(transcript, offset=(4, first_response_line))
+
+        assert app._clipboard == "First answer"
+
+        tool_line = sum(transcript._record_line_counts[:3])
+        await pilot.click(transcript, offset=(4, tool_line))
+
+        assert app._clipboard == "Read file\nPath: example.py"
+
+
+@pytest.mark.asyncio
+async def test_clicking_leading_system_record_copies_only_that_record() -> None:
+    app = TranscriptHarness()
+    async with app.run_test(size=(80, 24)) as pilot:
+        transcript = app.query_one(Transcript)
+        await transcript.append_blocks(
+            [
+                ("system", "Session: demo"),
+                ("user", "Question"),
+                ("assistant", "Answer"),
+            ]
+        )
+        await pilot.pause()
+
+        await pilot.click(transcript, offset=(4, 0))
+
+        assert app._clipboard == "Session: demo"
+
+
+@pytest.mark.asyncio
+async def test_clicking_scrolled_history_uses_the_visible_record() -> None:
+    app = PaddedTranscriptHarness()
+    async with app.run_test(size=(80, 12)) as pilot:
+        transcript = app.query_one(Transcript)
+        await transcript.append_blocks(
+            [
+                item
+                for turn in range(12)
+                for item in (
+                    ("user", f"Question {turn}"),
+                    ("assistant", f"Answer {turn}"),
+                )
+            ]
+        )
+        await pilot.pause()
+
+        target_record = 10
+        target_line = sum(transcript._record_line_counts[:target_record])
+        transcript.scroll_to(
+            y=target_line,
+            animate=False,
+            immediate=True,
+            force=True,
+        )
+        await pilot.pause()
+        await pilot.click(transcript, offset=(3, 1))
+
+        assert app._clipboard == "Question 5"
+
+
+@pytest.mark.asyncio
 async def test_transcript_render_line_paints_colored_markdown() -> None:
     app = TranscriptHarness()
     async with app.run_test(size=(80, 24)):

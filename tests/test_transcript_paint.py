@@ -58,7 +58,7 @@ def test_assistant_renders_simple_markdown() -> None:
     plain = _plain(strips)
     styles = _styles(strips)
 
-    assert "Kimi" in plain
+    assert "AI" in plain
     assert "Title" in plain
     assert "bold" in plain
     assert "**bold**" not in plain
@@ -76,6 +76,19 @@ def test_thinking_uses_muted_italic() -> None:
     )
     styles = _styles(strips)
     assert any(style is not None and style.italic for style in styles)
+
+
+def test_transcript_text_has_no_background_colors() -> None:
+    samples = (
+        ("user", "plain text"),
+        ("assistant", "Inline `code`\n\n```python\nprint(1)\n```"),
+        ("tool", 'read_file {"path": "demo.py"}'),
+        ("tool_result", "done"),
+    )
+
+    for kind, text in samples:
+        styles = _styles(render_record_strips(kind, text, width=48, console=_console()))
+        assert all(style is None or style.bgcolor is None for style in styles)
 
 
 def test_painted_strips_survive_monochrome_filter() -> None:
