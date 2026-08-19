@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments and local configuration
+.venv/
+.uv-cache/
+.env
+.env.*
+uv.lock
+
+# Test, lint, type-check, and coverage caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# AI Agents
+opencode.json
+.kimix_cache

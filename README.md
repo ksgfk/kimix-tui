@@ -1,0 +1,88 @@
+# kimix-tui
+
+一个独立、纯 Python的 Kimix TUI 原型。聊天循环消费
+`kimi_agent_sdk` 顶层公开接口；启动时的历史会话列表按 kimi-cli 的
+工作目录存储规则扫描，不扩展 SDK。
+
+## 当前能力
+
+- 无 `--session` 时先进入主页，可预览、恢复已有会话或新建
+- 按标题搜索会话，支持单选、多选当前结果和确认后批量删除
+- 恢复会话时回放 `wire.jsonl` 中的对话（用户/回复/思考/工具），可往上滚动查看
+- 使用 `Session.create()` / `Session.resume()` 创建或恢复会话
+- 增量显示回复和思考内容；AI 回复支持标题、加粗、代码等简单 Markdown
+- 展示工具调用、工具结果、步骤和上下文状态
+- 键盘审批：批准、会话内批准、拒绝
+- 支持 SDK 的结构化问答请求
+- 管理多个 LLM 配置，为新会话和每个历史 session 选择独立配置，并保存脱敏引用
+- `Ctrl+G` 取消当前生成
+- `/clear`、`/compact`、`/status`、`/help`、`/quit`（`/quit` 回到主页，不结束进程）
+
+## 启动
+
+先确保 Kimix 已完成模型配置，然后：
+
+```powershell
+uv sync
+uv run kimix-tui
+uv run kimix-tui --work-dir C:\path\to\project
+```
+
+不传 `--session` 时会在主页按更新时间倒序列出当前工作目录下的非空历史会话；高亮或单击会话可查看大小、存储格式、更新时间、待办等详情，按 Enter 或点击 **Open session** 进入。传入 `--session` 则跳过首次主页，直接进入该会话；从会话返回后仍会打开主页：
+
+```powershell
+uv run kimix-tui --work-dir C:\path\to\project --session my-session
+```
+
+指定模型或启用自动审批：
+
+```powershell
+uv run kimix-tui --model kimi --yolo
+```
+
+也可以使用与 Kimix CLI 相同的扁平 provider JSON 启动：
+
+```powershell
+uv run kimix-tui --config=C:\path\to\provider.json
+```
+
+主页顶部 **Settings** 修改 work dir 的新会话默认配置；可在 **Kimix provider config (.json)** 输入与 `kimix --config=...` 相同的外部 JSON 路径。**Add config** 校验并加入全局配置库，不改变当前绑定；从配置库选择后，**Use config** 才会应用到当前作用域。历史会话详情中的 **Configure** 修改该 session 下次恢复时使用的配置。聊天页按 `F4` 修改当前 session 的下次恢复配置，不会替换正在运行的 LLM。
+
+配置优先级为 session 配置高于 work dir 默认配置。工程 Settings 可以添加或移除配置库引用，但不能移除正在使用的工程默认；移除引用不会删除 provider JSON 文件。配置单个 session 时只能从现有配置中选择，也可以选择 **Project default**；session Settings 不提供添加或删除操作。选择工程默认会删除该 session 的独立配置引用，使它持续跟随工程默认。全局 `KIMI_SHARE_DIR/kimix-tui.json`（默认 `~/.kimi/kimix-tui.json`）只保存配置文件绝对路径列表和各 work dir 的默认路径；每个 session 的配置路径保存在 Kimi session 目录自己的 `kimix-tui.json`。这些引用文件不保存模型摘要、Provider 参数或 API Key。若引用的 provider JSON 丢失，界面显示其路径和 Missing，禁止进入并要求先重新配置。
+
+建议在 Windows Terminal 中运行。主页支持鼠标预览和打开会话。
+
+## Textual 结构
+
+- `KimixTuiApp` 只负责在顶层 Screen 之间路由
+- `HomeScreen` 和 `ChatScreen` 是完整页面
+- `LLMSettingsScreen`、`ApprovalScreen` 和 `QuestionScreen` 是阻塞当前页面的 `ModalScreen`
+- 所有 Screen 位于 `kimix_tui/screens/`，App 只保留路由和跨 Screen 状态
+- 页面内部使用 Textual 的 `Widget` 和 `Container` 组合，不定义额外的 window/panel 层级
+
+## 快捷键
+
+| 键 | 行为 |
+|---|---|
+| `Enter` | 主页打开高亮会话；聊天中发送输入 |
+| `n` | 主页新建 session |
+| `q` / `Esc` | 主页退出进程 |
+| `Esc` | 聊天中关闭当前会话并回到主页 |
+| `Ctrl+G` | 取消当前生成 |
+| `F2` | 聚焦输入框 |
+| `F4` | 打开 LLM Settings |
+| `a` | 审批弹窗中批准一次 |
+| `s` | 审批弹窗中对本会话批准 |
+| `r` / `Esc` | 审批弹窗中拒绝 |
+
+## 原型边界
+
+- 输入框目前是单行。
+- 进入已有会话时回放该会话的压缩历史（可往上滚动查看）；公开 SDK 仍无通用 history list 接口。
+- 未实现文件 diff 专用视图和多 Agent 视图。
+
+## 开发验证
+
+```powershell
+uv run pytest -q
+```
