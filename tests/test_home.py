@@ -20,6 +20,7 @@ from kimix_tui.screens.home import (
     SessionListItem,
 )
 from kimix_tui.session_index import SessionSummary
+from kimix_tui.widgets import PromptInput
 
 
 def _config_store(tmp_path: Path) -> LLMConfigStore:
@@ -183,7 +184,7 @@ async def test_new_session_shortcut_skips_resume(tmp_path: Path) -> None:
         assert opened[0].session_id is None
         chat = app.screen
         assert isinstance(chat, ChatScreen)
-        prompt = chat.query_one("#prompt", Input)
+        prompt = chat.query_one("#prompt", PromptInput)
         assert prompt.disabled is False
 
     assert session.closed is True
@@ -373,9 +374,11 @@ async def test_enter_resumes_highlighted_session(tmp_path: Path) -> None:
         chat = app.screen
         assert isinstance(chat, ChatScreen)
         assert any(record.text == "Session: sess-1" for record in chat.transcript.records)
+        assert str(chat.query_one("#leave-session", Button).label) == "Home"
         labels = _shown_binding_labels(app)
-        assert "Home" in labels
+        assert "Home" not in labels
         assert "Quit" not in labels
+        assert "Cancel" in labels
 
 
 @pytest.mark.asyncio
@@ -451,8 +454,8 @@ async def test_quit_command_returns_home(tmp_path: Path) -> None:
         await app.workers.wait_for_complete()
         chat = app.screen
         assert isinstance(chat, ChatScreen)
-        prompt = chat.query_one("#prompt", Input)
-        prompt.value = "/quit"
+        prompt = chat.query_one("#prompt", PromptInput)
+        prompt.text = "/quit"
         prompt.focus()
         await pilot.press("enter")
         await app.workers.wait_for_complete()

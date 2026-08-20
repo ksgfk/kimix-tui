@@ -21,15 +21,23 @@ Worker 会话工厂创建与恢复会话；启动时的历史会话列表按 kim
 
 ## 启动
 
-先确保 Kimix 已完成模型配置，然后：
+先克隆仓库并初始化 submodule（Kimix 源码在 `vendor/KimiX`），确保 Kimix 已完成模型配置，然后：
 
 ```powershell
+git clone --recurse-submodules https://github.com/ksgfk/kimix-tui.git
+cd kimix-tui
 uv sync
 uv run kimix-tui
 uv run kimix-tui --work-dir C:\path\to\project
 ```
 
-开发环境通过 editable source 使用相邻的 `../Kimi-CLI-X` 工作区；`kimix`、
+若仓库已克隆但尚未拉取 submodule：
+
+```powershell
+git submodule update --init --recursive
+```
+
+开发环境通过 editable source 使用仓库内的 `vendor/KimiX` submodule；`kimix`、
 `kimi_agent_sdk`、`kimi_cli`、`kosong` 和 `kaos` 都直接加载该工作区源码。
 
 不传 `--session` 时会在主页按更新时间倒序列出当前工作目录下的非空历史会话；高亮或单击会话可查看大小、存储格式、更新时间、待办等详情，按 Enter 或点击 **Open session** 进入。传入 `--session` 则跳过首次主页，直接进入该会话；从会话返回后仍会打开主页：
@@ -69,6 +77,7 @@ uv run kimix-tui --config=C:\path\to\provider.json
 | 键 | 行为 |
 |---|---|
 | `Enter` | 主页打开高亮会话；聊天中发送输入 |
+| `Ctrl+Enter` / `Shift+Enter` | 聊天输入框换行 |
 | `n` | 主页新建 session |
 | `q` / `Esc` | 主页退出进程 |
 | `Esc` | 聊天中关闭当前会话并回到主页 |
@@ -84,7 +93,6 @@ uv run kimix-tui --config=C:\path\to\provider.json
 
 ## 原型边界
 
-- 输入框目前是单行。
 - 进入已有会话时通过 `wire.jsonl` 的 turn 偏移索引分页回放历史；公开 SDK 仍无通用 history list 接口。
 - 未实现文件 diff 专用视图和多 Agent 视图。
 

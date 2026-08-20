@@ -1,4 +1,4 @@
-"""Measure history page and transcript memory while revisiting a wire log."""
+"""Measure timeline hydrate/unload and transcript memory while revisiting a wire log."""
 
 from __future__ import annotations
 
@@ -12,14 +12,7 @@ from pathlib import Path
 
 from textual.app import App, ComposeResult
 
-from kimix_tui.history import (
-    MAX_HISTORY_BLOCKS,
-    MAX_HISTORY_WINDOW_TURNS,
-    SessionHistory,
-    WireHistoryIndex,
-    _scan_wire_history_index,
-    load_wire_history_page,
-)
+from kimix_tui.history import Timeline, _scan_wire_history_index
 from kimix_tui.widgets import Transcript
 
 
@@ -63,14 +56,9 @@ class TranscriptApp(App[None]):
         yield Transcript(id="transcript")
 
 
-async def load_page(index: WireHistoryIndex, start: int) -> SessionHistory:
-    end = min(index.total_turns, start + MAX_HISTORY_WINDOW_TURNS)
-    return await load_wire_history_page(
-        index,
-        end_turn=end,
-        page_turns=end - start,
-        max_blocks=MAX_HISTORY_BLOCKS,
-    )
+async def seek_timeline(timeline: Timeline, turn: int) -> list[tuple[str, str, int]]:
+    await timeline.ensure_turn(turn)
+    return timeline.display_items()
 
 
 def print_stats(prefix: str, step: int, heap_peak: int) -> None:
@@ -85,21 +73,27 @@ async def main(path: Path, jumps: int, interval: int, paint: bool) -> None:
     randomizer = random.Random(246822)
     tracemalloc.start()
     index = await asyncio.to_thread(_scan_wire_history_index, path)
-    print(f"index turns={index.total_turns} offsets={len(index.turn_offsets)}")
+    timeline = Timeline(index=index)
+    await timeline.open()
+    print(
+        f"index turns={index.total_turns} offsets={len(index.turn_offsets)} "
+        f"hydrated={timeline.hydrated_chars()}"
+    )
 
     print("phase=loader")
     before_loader = tracemalloc.take_snapshot()
-    last_page_chars = 0
+    last_chars = 0
     for step in range(jumps):
-        start = randomizer.randrange(max(1, index.total_turns - MAX_HISTORY_WINDOW_TURNS))
-        page = await load_page(index, start)
-        last_page_chars = sum(len(block.text) for block in page.blocks)
-        del page
+        turn = randomizer.randrange(max(1, index.total_turns))
+        items = await seek_timeline(timeline, turn)
+        last_chars = timeline.hydrated_chars()
+        del items
         if step % interval == 0:
             gc.collect()
             current, peak = tracemalloc.get_traced_memory()
             print(
-                f"loader step={step} page_chars={last_page_chars / 1024**2:.1f}MiB "
+                f"loader step={step} turn={turn} hydrated={last_chars / 1024**2:.1f}MiB "
+                f"materialized={timeline.materialized_turn_count} "
                 f"heap={current / 1024**2:.1f}MiB rss={rss_mib():.1f}MiB "
                 f"peak={peak / 1024**2:.1f}MiB"
             )
@@ -120,17 +114,16 @@ async def main(path: Path, jumps: int, interval: int, paint: bool) -> None:
         await transcript.append_block("system", "Session: diagnostic")
         transcript.mark_history_window(1, 1)
         for step in range(jumps):
-            start = randomizer.randrange(max(1, index.total_turns - MAX_HISTORY_WINDOW_TURNS))
-            page = await load_page(index, start)
+            turn = randomizer.randrange(max(1, index.total_turns))
+            items = await seek_timeline(timeline, turn)
             await transcript.replace_history_blocks(
-                [(block.kind, block.text) for block in page.blocks]
+                [(kind, text, item_turn) for kind, text, item_turn in items]
             )
-            transcript.jump_to_history_start()
-            transcript.scroll_end(animate=False, immediate=True, force=True)
+            transcript.jump_to_turn(turn)
             if paint:
                 for row in range(transcript.size.height):
                     transcript.render_line(row)
-            del page
+            del items
             await pilot.pause()
             if step % interval == 0:
                 gc.collect()

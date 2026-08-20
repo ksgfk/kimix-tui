@@ -12,6 +12,13 @@ from rich.style import Style
 from rich.text import Text
 from textual.strip import Strip
 
+from kimix_tui.tool_display import (
+    strip_tool_name,
+    tool_label,
+    tool_name_from_text,
+    tool_styles,
+)
+
 _NULL = Style.null()
 _HEADER_MARK = "▌ "
 _BODY_INDENT = "  "
@@ -21,9 +28,9 @@ _LABELS: dict[str, tuple[str, str]] = {
     "user": ("You", "bold bright_cyan"),
     "assistant": ("AI", "bold bright_green"),
     "thinking": ("Think", "italic bright_black"),
-    "tool": ("Tool", "bold bright_magenta"),
-    "tool_result": ("Result", "bright_blue"),
-    "approval": ("Approval", "bold yellow"),
+    "tool": ("Tool", "bold bright_black"),
+    "tool_result": ("Result", "bright_black"),
+    "approval": ("Approval", "bold bright_black"),
     "system": ("System", "bright_black"),
     "error": ("Error", "bold red"),
 }
@@ -32,18 +39,23 @@ _BAR_COLOR: dict[str, str] = {
     "user": "bright_cyan",
     "assistant": "bright_green",
     "thinking": "bright_black",
-    "tool": "magenta",
-    "tool_result": "bright_blue",
-    "approval": "yellow",
+    "tool": "bright_black",
+    "tool_result": "bright_black",
+    "approval": "bright_black",
     "system": "bright_black",
     "error": "red",
 }
 
 _BODY_STYLE: dict[str, str] = {
     "thinking": "italic bright_black",
+    "tool": "bright_black",
+    "tool_result": "bright_black",
+    "approval": "bright_black",
     "system": "bright_black",
-    "error": "red",
+    "error": "bright_black",
 }
+
+_DEFAULT_EXPANDED_KINDS = frozenset({"thinking"})
 
 _MARKDOWN_HINTS = ("`", "*", "_", "#", ">", "[", "~~")
 _DIALOGUE_KINDS = frozenset({"user", "assistant"})
@@ -58,9 +70,13 @@ _SUMMARY_SECTION_LABELS = frozenset(
 )
 
 
-def record_label(kind: str) -> str:
+def record_label(kind: str, text: str = "") -> str:
     """Return the label shown for a transcript record."""
 
+    if kind in {"tool", "tool_result", "error"} and text:
+        name = tool_name_from_text(text)
+        if name and (kind != "error" or tool_styles(name) is not None):
+            return tool_label(name, kind=kind)
     return _LABELS.get(kind, (kind.title(), "bold"))[0]
 
 
@@ -76,13 +92,19 @@ def is_compact_record(kind: str, *, expanded: bool = False) -> bool:
     return not is_dialogue_record(kind) and not expanded
 
 
+def default_expanded(kind: str) -> bool:
+    """Return whether a record kind starts expanded."""
+
+    return kind in _DEFAULT_EXPANDED_KINDS
+
+
 def copy_hit_start(width: int) -> int:
     """Return the first column occupied by the header copy action."""
 
     return max(0, width - cell_len(_COPY_SUFFIX))
 
 
-def _compact_summary(text: str, width: int) -> str:
+def _compact_summary(text: str, width: int, *, lead_name: str | None = None) -> str:
     """Build a useful one-line summary while preserving wide characters."""
 
     lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
@@ -95,9 +117,13 @@ def _compact_summary(text: str, width: int) -> str:
             if line not in _SUMMARY_SECTION_LABELS
             and not line.startswith(_SUMMARY_METADATA_PREFIXES)
         ]
-        summary = lines[0]
+        summary = strip_tool_name(lines[0], lead_name) if lead_name else lines[0]
+        if not summary and details:
+            summary = details.pop(0)
         if details:
             summary += " · " + " ".join(details)
+        if not summary:
+            summary = lines[0]
     if cell_len(summary) <= width:
         return summary
     if width <= 3:
@@ -192,6 +218,14 @@ def _header_strip(
     return Strip(segments, _cell_length(segments))
 
 
+def _styled_text(text: str, style: str = "") -> Text:
+    """Build Text with a real span so console.render keeps the style."""
+
+    if style:
+        return Text.assemble((text, style))
+    return Text(text)
+
+
 def _markdown_lines(text: str, width: int, console: Console) -> list[list[Segment]]:
     markdown = Markdown(text, justify="left", hyperlinks=False)
     options = console.options.update(width=width, highlight=False)
@@ -215,9 +249,20 @@ def render_record_strips(
 ) -> list[Strip]:
     """Turn one transcript row into wrapped strips with kind colors."""
 
+    tool_name = tool_name_from_text(text) if kind in {"tool", "tool_result", "error"} else None
+    family_styles = tool_styles(tool_name) if tool_name else None
     label, label_style = _LABELS.get(kind, (kind.title(), "bold"))
     mark_style = Style.parse(_BAR_COLOR.get(kind, "bright_black"))
-    body_style = _BODY_STYLE.get(kind, "")
+    if tool_name and kind in {"tool", "tool_result"}:
+        label = tool_label(tool_name, kind=kind)
+        if family_styles:
+            label_style = family_styles[0]
+            mark_style = Style.parse(family_styles[1])
+    elif family_styles and kind == "error":
+        label = tool_label(tool_name, kind="tool_result")
+        label_style = "bold red"
+        mark_style = Style.parse("red")
+    body_style = _BODY_STYLE.get(kind, "" if is_dialogue_record(kind) else "bright_black")
     body_width = max(8, width - cell_len(_BODY_INDENT))
     header_width = max(0, width - cell_len(_HEADER_MARK) - cell_len(_COPY_SUFFIX))
     strips: list[Strip] = []
@@ -230,30 +275,30 @@ def render_record_strips(
         summary_width = max(0, header_width - cell_len(prefix))
         header = Text.assemble(
             (prefix, label_style),
-            (_compact_summary(text, summary_width), body_style),
+            (_compact_summary(text, summary_width, lead_name=tool_name), body_style),
         )
         strips.append(
             _header_strip(header, width=width, console=console, mark_style=mark_style)
         )
     elif auxiliary_record:
-        prefix = f"▾ {label}  "
-        summary_width = max(0, header_width - cell_len(prefix))
         strips.append(
             _header_strip(
-                Text.assemble(
-                    (prefix, label_style),
-                    (_compact_summary(text, summary_width), body_style),
-                ),
+                _styled_text(f"▾ {label}", label_style),
                 width=width,
                 console=console,
                 mark_style=mark_style,
             )
         )
-        body = Text(text or "(no details)", style=body_style)
+        body_text = text or "(no details)"
+        if tool_name:
+            body_lines = body_text.splitlines() or [body_text]
+            body_lines[0] = strip_tool_name(body_lines[0], tool_name)
+            body_text = "\n".join(body_lines).strip() or "(no details)"
+        body = _styled_text(body_text, body_style)
         for wrapped in body.wrap(console, body_width, overflow="fold"):
             strips.append(_strip_from_text(wrapped, console))
     elif kind == "assistant":
-        header = Text(label, style=label_style)
+        header = _styled_text(label, label_style)
         strips.append(
             _header_strip(header, width=width, console=console, mark_style=mark_style)
         )
@@ -267,19 +312,19 @@ def render_record_strips(
                 segments = _with_prefix(line, _BODY_INDENT, _NULL)
                 strips.append(Strip(segments, _cell_length(segments)))
         except Exception:  # noqa: BLE001 - fall back to plain body
-            body = Text(text, style=body_style)
+            body = _styled_text(text, body_style)
             for wrapped in body.wrap(console, body_width, overflow="fold"):
                 strips.append(_strip_from_text(wrapped, console))
     else:
         strips.append(
             _header_strip(
-                Text(label, style=label_style),
+                _styled_text(label, label_style),
                 width=width,
                 console=console,
                 mark_style=mark_style,
             )
         )
-        body = Text(text, style=body_style)
+        body = _styled_text(text, body_style)
         for wrapped in body.wrap(console, body_width, overflow="fold"):
             strips.append(_strip_from_text(wrapped, console))
 

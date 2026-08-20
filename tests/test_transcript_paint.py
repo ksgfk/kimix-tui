@@ -74,8 +74,14 @@ def test_thinking_uses_muted_italic() -> None:
         "considering options",
         width=48,
         console=_console(),
+        expanded=True,
     )
+    header = "".join(segment.text for segment in strips[0]._segments)
+    plain = _plain(strips)
     styles = _styles(strips)
+    assert "▾ Think" in header
+    assert "considering options" not in header
+    assert "considering options" in plain
     assert any(style is not None and style.italic for style in styles)
 
 
@@ -88,8 +94,8 @@ def test_non_dialogue_records_are_compacted_to_one_line() -> None:
     )
 
     assert len(strips) == 1
-    assert "▸ Result" in _plain(strips)
-    assert "Read file succeeded" in _plain(strips)
+    assert "▸ Read" in _plain(strips)
+    assert "file succeeded" in _plain(strips)
     assert "Call ID" not in _plain(strips)
     assert "Output" in _plain(strips)
 
@@ -104,7 +110,7 @@ def test_tool_summary_prioritizes_arguments_over_call_metadata() -> None:
 
     plain = _plain(strips)
     assert len(strips) == 1
-    assert "read_file" in plain
+    assert "▸ Read" in plain
     assert "demo.py" in plain
     assert "Call ID" not in plain
 
@@ -119,10 +125,55 @@ def test_expanded_non_dialogue_records_show_the_full_message() -> None:
     )
 
     plain = _plain(strips)
+    header = "".join(segment.text for segment in strips[0]._segments)
     assert len(strips) > 1
-    assert "▾ Result" in plain
+    assert "▾ Read" in header
+    assert "Read file succeeded" not in header
     assert "Call ID: call-123" in plain
     assert "Output: all details" in plain
+
+
+def test_non_dialogue_body_is_gray_not_vivid() -> None:
+    samples = (
+        ("tool", "custom_mcp"),
+        ("tool_result", "succeeded"),
+        ("thinking", "hmm"),
+        ("system", "ready"),
+        ("approval", "allow this"),
+    )
+    for kind, text in samples:
+        styles = _styles(
+            render_record_strips(
+                kind,
+                text,
+                width=48,
+                console=_console(),
+                expanded=True,
+            )
+        )
+        joined = " ".join(str(style).lower() for style in styles if style)
+        assert "magenta" not in joined
+        assert "red" not in joined
+        assert "yellow" not in joined
+        assert "blue" not in joined
+        assert "black" in joined
+
+
+def test_known_tools_use_specialized_titles_and_colors() -> None:
+    cases = (
+        ("tool", "grep  def foo", "Grep", "cyan"),
+        ("tool_result", "grep  3 matches", "Grep", "cyan"),
+        ("tool", "read  a.py", "Read", "cyan"),
+        ("tool_result", "read  a.py", "Read", "cyan"),
+        ("tool", "todo_write  2 items", "Todo", "yellow"),
+        ("tool", "bash  ls -la", "Bash", "green"),
+    )
+    for kind, text, title, color in cases:
+        strips = render_record_strips(kind, text, width=48, console=_console())
+        plain = _plain(strips)
+        joined = " ".join(str(style).lower() for style in _styles(strips) if style)
+        assert f"▸ {title}" in plain
+        assert color in joined
 
 
 def test_compacted_records_use_ascii_ellipsis_when_clipped() -> None:

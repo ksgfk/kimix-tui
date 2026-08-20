@@ -1,0 +1,3 @@
+[submodule "vendor/KimiX"]
+	path = vendor/KimiX
+	url = https://github.com/Sikao-Engine/KimiX.git

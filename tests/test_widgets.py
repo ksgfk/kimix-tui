@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from textual.app import App, ComposeResult
 
-from kimix_tui.widgets import Transcript
+from kimix_tui.widgets import PromptInput, Transcript
 
 
 class TranscriptHarness(App[None]):
@@ -27,6 +27,18 @@ class PaddedTranscriptHarness(App[None]):
 class BoundedTranscriptHarness(App[None]):
     def compose(self) -> ComposeResult:
         yield Transcript(id="transcript", max_chars=32)
+
+
+class PromptHarness(App[None]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.submitted: list[str] = []
+
+    def compose(self) -> ComposeResult:
+        yield PromptInput(placeholder="Ask", id="prompt")
+
+    def on_prompt_input_submitted(self, event: PromptInput.Submitted) -> None:
+        self.submitted.append(event.value)
 
 
 def _visible_text(transcript: Transcript) -> str:
@@ -74,13 +86,20 @@ async def test_transcript_keeps_full_dialogue_text_when_streaming() -> None:
 
 
 @pytest.mark.asyncio
-async def test_transcript_still_bounds_auxiliary_records() -> None:
+async def test_transcript_keeps_full_auxiliary_text() -> None:
     app = TranscriptHarness()
     async with app.run_test(size=(80, 24)):
         transcript = app.query_one(Transcript)
-        await transcript.append_block("tool", "x" * 4_500)
+        tool_text = "x" * 4_500
+        await transcript.append_block("tool", tool_text)
 
-        assert "truncated" in transcript.records[0].text
+        assert transcript.records[0].text == tool_text
+
+        stream_first = "a" * 100
+        stream_second = "b" * 4_500
+        await transcript.append_stream("thinking", stream_first)
+        await transcript.append_stream("thinking", stream_second)
+        assert transcript.records[-1].text == stream_first + stream_second
 
 
 @pytest.mark.asyncio
@@ -124,7 +143,7 @@ async def test_non_dialogue_records_take_one_transcript_line() -> None:
         await transcript.append_block("tool", "Read file\nPath: example.py\nArguments: {}")
 
         assert transcript._record_line_counts == [1]
-        assert "▸ Tool  Read file" in transcript.render_line(0).text
+        assert "▸ Read" in transcript.render_line(0).text
 
 
 @pytest.mark.asyncio
@@ -202,6 +221,23 @@ async def test_auxiliary_record_expands_collapses_and_copies_from_action() -> No
         await pilot.click(transcript, offset=(8, 0))
         assert transcript.records[0].expanded is False
         assert transcript._record_line_counts == [1]
+
+
+@pytest.mark.asyncio
+async def test_thinking_records_start_expanded_in_italic() -> None:
+    app = TranscriptHarness()
+    async with app.run_test(size=(48, 24)) as pilot:
+        transcript = app.query_one(Transcript)
+        await transcript.append_block("thinking", "considering options")
+        await pilot.pause()
+
+        visible = _visible_text(transcript)
+        assert transcript.records[0].expanded is True
+        assert transcript._record_line_counts[0] > 1
+        assert "▾ Think" in visible
+        assert "considering options" in visible
+        header = transcript.render_line(0).text
+        assert "considering options" not in header
 
 
 @pytest.mark.asyncio
@@ -343,3 +379,129 @@ async def test_replacing_history_window_keeps_live_rows() -> None:
             ("assistant", "live"),
         ]
         assert transcript.history_window == (1, 3)
+
+
+@pytest.mark.asyncio
+async def test_jump_to_turn_unpins_and_scrolls_immediately() -> None:
+    app = TranscriptHarness()
+    async with app.run_test(size=(80, 12)):
+        transcript = app.query_one(Transcript)
+        await transcript.replace_history_blocks(
+            [
+                ("user", f"q{index}", index)
+                for index in range(20)
+            ]
+        )
+        transcript.jump_to_latest()
+        assert transcript.pinned_to_latest is True
+
+        transcript.jump_to_turn(0)
+
+        assert transcript.pinned_to_latest is False
+        assert transcript.viewport_turn() == 0
+        assert "q0" in _visible_text(transcript)
+        assert "q19" not in _visible_text(transcript)
+
+
+@pytest.mark.asyncio
+async def test_jump_to_latest_pins_without_leaving_older_rows() -> None:
+    app = TranscriptHarness()
+    async with app.run_test(size=(80, 12)):
+        transcript = app.query_one(Transcript)
+        await transcript.replace_history_blocks(
+            [("user", f"q{index}", index) for index in range(20)]
+        )
+        transcript.jump_to_turn(0)
+        assert transcript.pinned_to_latest is False
+
+        transcript.jump_to_latest()
+
+        assert transcript.pinned_to_latest is True
+        assert transcript.scroll_offset.y == transcript.max_scroll_y
+        assert "q19" in _visible_text(transcript)
+
+
+@pytest.mark.asyncio
+async def test_replace_history_keeps_in_flight_stream() -> None:
+    app = TranscriptHarness()
+    async with app.run_test(size=(80, 24)):
+        transcript = app.query_one(Transcript)
+        await transcript.append_block("system", "Session: demo")
+        transcript.mark_history_window()
+        await transcript.replace_history_blocks([("user", "q0", 0)])
+        await transcript.append_stream("assistant", "hel")
+        await transcript.append_stream("assistant", "lo")
+
+        await transcript.replace_history_blocks([("user", "q0", 0), ("assistant", "old", 0)])
+        await transcript.append_stream("assistant", "!")
+
+        assert [record.text for record in transcript.records] == [
+            "Session: demo",
+            "q0",
+            "old",
+            "hello!",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_history_window_skips_fifo_trim() -> None:
+    app = BoundedTranscriptHarness()
+    async with app.run_test(size=(80, 24)):
+        transcript = app.query_one(Transcript)
+        transcript.mark_history_window()
+        await transcript.append_blocks(
+            [("user", f"message-{index}-{'x' * 20}") for index in range(10)]
+        )
+
+        assert transcript.omitted_records == 0
+        assert len(transcript.records) == 10
+
+
+@pytest.mark.asyncio
+async def test_prompt_enter_submits_without_inserting_newline() -> None:
+    app = PromptHarness()
+    async with app.run_test(size=(80, 24)) as pilot:
+        prompt = app.query_one(PromptInput)
+        prompt.focus()
+        await pilot.press("h", "i", "enter")
+        assert app.submitted == ["hi"]
+        assert prompt.text == "hi"
+
+
+@pytest.mark.asyncio
+async def test_prompt_ctrl_enter_inserts_newline_then_enter_sends() -> None:
+    app = PromptHarness()
+    async with app.run_test(size=(80, 24)) as pilot:
+        prompt = app.query_one(PromptInput)
+        prompt.focus()
+        await pilot.press("h", "i", "ctrl+enter", "t", "h", "e", "r", "e")
+        assert prompt.text == "hi\nthere"
+        assert app.submitted == []
+        await pilot.press("enter")
+        assert app.submitted == ["hi\nthere"]
+
+
+@pytest.mark.asyncio
+async def test_prompt_shift_enter_inserts_newline() -> None:
+    app = PromptHarness()
+    async with app.run_test(size=(80, 24)) as pilot:
+        prompt = app.query_one(PromptInput)
+        prompt.focus()
+        await pilot.press("a", "shift+enter", "b")
+        assert prompt.text == "a\nb"
+        assert app.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_prompt_grows_with_lines_and_caps_height() -> None:
+    app = PromptHarness()
+    async with app.run_test(size=(80, 24)) as pilot:
+        prompt = app.query_one(PromptInput)
+        prompt.focus()
+        await pilot.pause()
+        assert prompt.outer_size.height == PromptInput.MIN_HEIGHT
+        await pilot.press(*(["ctrl+enter"] * 8))
+        await pilot.pause()
+        assert prompt.outer_size.height == PromptInput.MAX_HEIGHT
+        assert prompt.text.count("\n") == 8
+

@@ -1,21 +1,24 @@
-"""Virtual transcript with bounded records and lazy visible-row painting."""
+"""Chat widgets: multiline prompt input and virtual transcript."""
 
 from __future__ import annotations
 
 from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import ClassVar
 
 from rich.cells import cell_len
-from textual import events
+from textual import events, on
+from textual.binding import Binding
 from textual.geometry import Size
 from textual.message import Message
 from textual.scroll_view import ScrollView
 from textual.strip import Strip
+from textual.widgets import TextArea
 
-from kimix_tui.rendering import bounded_concat, truncate_display
 from kimix_tui.transcript_paint import (
     copy_hit_start,
+    default_expanded,
     is_compact_record,
     is_dialogue_record,
     record_label,
@@ -24,11 +27,124 @@ from kimix_tui.transcript_paint import (
 )
 
 
+class PromptInput(TextArea):
+    """Chat composer: Enter sends, Ctrl+Enter / Shift+Enter insert a newline."""
+
+    MIN_HEIGHT = 3
+    MAX_HEIGHT = 8
+    BORDER_CHROME = 2
+
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("enter", "submit", "Send", show=False, priority=True),
+        Binding("ctrl+enter,ctrl+j,shift+enter", "newline", "Newline", show=False, priority=True),
+    ]
+
+    DEFAULT_CSS = """
+    PromptInput {
+        width: 100%;
+        height: 3;
+        min-height: 3;
+        max-height: 8;
+        padding: 0 1;
+        overflow-x: hidden;
+        scrollbar-size-vertical: 1;
+        scrollbar-size-horizontal: 0;
+    }
+    """
+
+    @dataclass
+    class Submitted(Message):
+        """Posted when Enter is pressed to send the composer contents."""
+
+        prompt: PromptInput
+        value: str
+
+        @property
+        def control(self) -> PromptInput:
+            return self.prompt
+
+    def __init__(
+        self,
+        placeholder: str = "",
+        *,
+        name: str | None = None,
+        id: str | None = None,
+        classes: str | None = None,
+        disabled: bool = False,
+        tooltip: str | None = None,
+    ) -> None:
+        super().__init__(
+            "",
+            soft_wrap=True,
+            tab_behavior="focus",
+            show_line_numbers=False,
+            highlight_cursor_line=False,
+            placeholder=placeholder,
+            name=name,
+            id=id,
+            classes=classes,
+            disabled=disabled,
+            tooltip=tooltip,
+        )
+        self._fitted_height = self.MIN_HEIGHT
+        self.styles.height = self.MIN_HEIGHT
+
+    def action_submit(self) -> None:
+        self.post_message(self.Submitted(self, self.text))
+
+    def action_newline(self) -> None:
+        if self.read_only or self.disabled:
+            return
+        start, end = self.selection
+        self.replace("\n", start, end, maintain_selection_offset=False)
+
+    async def _on_key(self, event: events.Key) -> None:
+        if not self.read_only and not self.disabled:
+            if event.key == "enter":
+                event.stop()
+                event.prevent_default()
+                self.action_submit()
+                return
+            if event.key in {"ctrl+enter", "ctrl+j", "shift+enter"}:
+                event.stop()
+                event.prevent_default()
+                self.action_newline()
+                return
+        await super()._on_key(event)
+
+    def on_mount(self) -> None:
+        self.call_after_refresh(self._sync_height)
+
+    def on_resize(self, _event: events.Resize) -> None:
+        self._sync_height()
+
+    @on(TextArea.Changed)
+    def _on_prompt_changed(self, _event: TextArea.Changed) -> None:
+        self._sync_height()
+
+    def _content_line_count(self) -> int:
+        wrapped_height = self.wrapped_document.height
+        if wrapped_height > 0:
+            return wrapped_height
+        return self.text.count("\n") + 1
+
+    def _sync_height(self) -> None:
+        target = min(
+            self.MAX_HEIGHT,
+            max(self.MIN_HEIGHT, self._content_line_count() + self.BORDER_CHROME),
+        )
+        if target == self._fitted_height:
+            return
+        self._fitted_height = target
+        self.styles.height = target
+
+
 @dataclass(slots=True)
 class TranscriptRecord:
     kind: str
     text: str
     expanded: bool = False
+    turn: int | None = None
 
 
 MAX_TRANSCRIPT_CHARS = 64 * 1024 * 1024
@@ -37,18 +153,23 @@ _LINE_BLOCK_SIZE = 256
 _STRIP_CACHE_SIZE = 32
 
 
-def _stored_record_text(kind: str, text: str) -> str:
-    """Keep dialogue intact while bounding verbose auxiliary records."""
+def _new_record(kind: str, text: str, *, turn: int | None = None) -> TranscriptRecord:
+    return TranscriptRecord(kind, text, expanded=default_expanded(kind), turn=turn)
 
-    return text if is_dialogue_record(kind) else truncate_display(text)
+
+def _record_from_history_item(
+    item: tuple[str, str] | tuple[str, str, int],
+) -> TranscriptRecord:
+    kind, text = item[0], item[1]
+    turn = item[2] if len(item) > 2 else None
+    return _new_record(kind, text, turn=turn)
 
 
 class Transcript(ScrollView, can_focus=True):
     """Scrollable chat log that virtualizes painting.
 
-    Dialogue records retain their complete text. Auxiliary records are kept
-    within a bounded display size, while line heights are estimated cheaply
-    and Rich strips are generated lazily near the viewport.
+    Record text is kept in full. Line heights are estimated cheaply and Rich
+    strips are generated lazily near the viewport.
     """
 
     class ReachedTop(Message):
@@ -56,6 +177,13 @@ class Transcript(ScrollView, can_focus=True):
 
     class ReachedBottom(Message):
         """Emitted once when the user reaches the newest loaded row."""
+
+    class ViewportTurn(Message):
+        """Emitted when the history turn at the top of the viewport changes."""
+
+        def __init__(self, turn: int | None) -> None:
+            super().__init__()
+            self.turn = turn
 
     DEFAULT_CSS = """
     Transcript {
@@ -92,6 +220,7 @@ class Transcript(ScrollView, can_focus=True):
         self._bottom_event_armed = True
         self._history_start: int | None = None
         self._history_end: int | None = None
+        self._last_viewport_turn: int | None = None
 
     def on_mount(self) -> None:
         self.anchor()
@@ -202,6 +331,9 @@ class Transcript(ScrollView, can_focus=True):
         self._sync_virtual_size()
 
     def _trim_records(self) -> None:
+        if self._history_start is not None:
+            # Timeline unloads offscreen bodies; do not FIFO-drop history or the live tail.
+            return
         if self._max_chars <= 0 or self._record_chars <= self._max_chars:
             return
         target = max(1, int(self._max_chars * _TRIM_TARGET_RATIO))
@@ -270,6 +402,48 @@ class Transcript(ScrollView, can_focus=True):
         self._bottom_event_armed = False
         self._maybe_scroll_end()
 
+    @property
+    def pinned_to_latest(self) -> bool:
+        return self._stick_to_bottom
+
+    def viewport_turn(self) -> int | None:
+        """0-based history turn at the top of the viewport, if any."""
+
+        record_index, _local = self._record_at_line(round(self.scroll_y))
+        if record_index is None or not (0 <= record_index < len(self.records)):
+            return None
+        return self.records[record_index].turn
+
+    def jump_to_turn(self, turn: int) -> None:
+        """Scroll the first record of ``turn`` to the top without animation."""
+
+        start = self._history_start or 0
+        end = self._history_end or len(self.records)
+        target_index = None
+        for index in range(start, end):
+            if self.records[index].turn == turn:
+                target_index = index
+                break
+        if target_index is None:
+            return
+        target_y = sum(self._record_line_counts[:target_index])
+        self._stick_to_bottom = False
+        self._anchored = False
+        self._anchor_released = True
+        self._top_event_armed = False
+        self._bottom_event_armed = False
+        self.scroll_to(
+            y=target_y,
+            animate=False,
+            immediate=True,
+            force=True,
+        )
+        # A short window can clamp this seek to the visual end; that is not pin-to-latest.
+        self._stick_to_bottom = False
+        if not self.is_vertical_scroll_end:
+            self._bottom_event_armed = True
+        self.refresh()
+
     def jump_to_history_start(self) -> None:
         """Place the first record in the current history window at the top."""
 
@@ -322,23 +496,34 @@ class Transcript(ScrollView, can_focus=True):
         super().watch_scroll_y(old_value, new_value)
         if self._anchored and self._anchor_released:
             self._check_anchor()
-        self._stick_to_bottom = self.is_vertical_scroll_end or (
-            self._anchored and not self._anchor_released
-        )
         at_top = new_value <= 0.5
         at_bottom = self.is_vertical_scroll_end
+        if self._anchored and not self._anchor_released:
+            self._stick_to_bottom = True
+        elif at_bottom and new_value > old_value:
+            # User scrolled down to the end of the current view.
+            self._stick_to_bottom = True
+        elif not at_bottom:
+            self._stick_to_bottom = False
         if at_top:
-            if self._top_event_armed and self.is_attached:
+            # Short transcripts sit at top and bottom at once; that is not a
+            # user scroll to older history, so do not auto-page.
+            if self._top_event_armed and self.is_attached and not at_bottom:
                 self._top_event_armed = False
                 self.post_message(self.ReachedTop())
         else:
             self._top_event_armed = True
         if at_bottom:
-            if self._bottom_event_armed and self.is_attached:
+            if self._bottom_event_armed and self.is_attached and not at_top:
                 self._bottom_event_armed = False
                 self.post_message(self.ReachedBottom())
         else:
             self._bottom_event_armed = True
+        viewport_turn = self.viewport_turn()
+        if viewport_turn != self._last_viewport_turn:
+            self._last_viewport_turn = viewport_turn
+            if self.is_attached:
+                self.post_message(self.ViewportTurn(viewport_turn))
         if round(old_value) != round(new_value):
             # ScrollView refreshes a padding-translated region; clear the
             # line cache so painted rows match the new offset.
@@ -398,7 +583,7 @@ class Transcript(ScrollView, can_focus=True):
 
     def _copy_record(self, record: TranscriptRecord) -> None:
         self.app.copy_to_clipboard(record.text)
-        self.notify(f"{record_label(record.kind)} message copied")
+        self.notify(f"{record_label(record.kind, record.text)} message copied")
 
     def _toggle_record(self, index: int) -> None:
         record = self.records[index]
@@ -452,11 +637,13 @@ class Transcript(ScrollView, can_focus=True):
             return None
         return self._history_start, self._history_end
 
-    async def prepend_history_blocks(self, items: Sequence[tuple[str, str]]) -> int:
+    async def prepend_history_blocks(
+        self,
+        items: Sequence[tuple[str, str] | tuple[str, str, int]],
+    ) -> int:
         """Insert older records while keeping the first visible row anchored."""
 
-        self.finish_stream()
-        records = [TranscriptRecord(kind, _stored_record_text(kind, text)) for kind, text in items]
+        records = [_record_from_history_item(item) for item in items]
         if not records:
             return 0
         added_chars = sum(len(record.text) for record in records)
@@ -501,10 +688,12 @@ class Transcript(ScrollView, can_focus=True):
             force=True,
         )
 
-    async def replace_history_blocks(self, items: Sequence[tuple[str, str]]) -> None:
+    async def replace_history_blocks(
+        self,
+        items: Sequence[tuple[str, str] | tuple[str, str, int]],
+    ) -> None:
         """Replace the bounded history window while leaving live rows intact."""
 
-        self.finish_stream()
         if self._history_start is None:
             self.mark_history_window()
         assert self._history_start is not None
@@ -514,9 +703,7 @@ class Transcript(ScrollView, can_focus=True):
         del self.records[start:end]
         del self._record_line_counts[start:end]
         self._record_chars -= sum(len(record.text) for record in removed)
-        replacement = [
-            TranscriptRecord(kind, _stored_record_text(kind, text)) for kind, text in items
-        ]
+        replacement = [_record_from_history_item(item) for item in items]
         if self._max_chars > 0:
             available = max(0, self._max_chars - self._record_chars)
             replacement_chars = sum(len(record.text) for record in replacement)
@@ -549,17 +736,14 @@ class Transcript(ScrollView, can_focus=True):
 
     async def append_block(self, kind: str, text: str) -> None:
         self.finish_stream()
-        self._append_record(TranscriptRecord(kind, _stored_record_text(kind, text)))
+        self._append_record(_new_record(kind, text))
         self.refresh()
         self._maybe_scroll_end()
 
     async def append_blocks(self, items: Sequence[tuple[str, str]]) -> None:
         self.finish_stream()
         for kind, text in items:
-            self._append_record(
-                TranscriptRecord(kind, _stored_record_text(kind, text)),
-                sync=False,
-            )
+            self._append_record(_new_record(kind, text), sync=False)
         self._sync_virtual_size()
         self.refresh()
         self._maybe_scroll_end()
@@ -575,26 +759,16 @@ class Transcript(ScrollView, can_focus=True):
             return
         if self._stream_kind != kind or self._stream_record is None:
             self.finish_stream()
-            record = TranscriptRecord(
-                kind,
-                fragment if is_dialogue_record(kind) else bounded_concat("", fragment),
-            )
+            record = _new_record(kind, fragment)
             self._append_record(record)
             self._stream_kind = kind
             self._stream_record = record
         else:
-            if is_dialogue_record(kind):
-                clipped = fragment if replace else self._stream_record.text + fragment
-            else:
-                clipped = (
-                    truncate_display(fragment)
-                    if replace
-                    else bounded_concat(self._stream_record.text, fragment)
-                )
-            if clipped == self._stream_record.text:
+            updated = fragment if replace else self._stream_record.text + fragment
+            if updated == self._stream_record.text:
                 return
-            self._record_chars += len(clipped) - len(self._stream_record.text)
-            self._stream_record.text = clipped
+            self._record_chars += len(updated) - len(self._stream_record.text)
+            self._stream_record.text = updated
             self._replace_last_strips(sync=False)
             self._trim_records()
             self._sync_virtual_size()

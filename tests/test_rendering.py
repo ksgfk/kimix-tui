@@ -22,11 +22,9 @@ from kimi_agent_sdk import (
 
 from kimix_tui.rendering import (
     RenderState,
-    bounded_concat,
     format_display_blocks,
     format_status,
     render_wire_message,
-    truncate_display,
 )
 
 
@@ -55,8 +53,9 @@ def test_tool_call_pretty_prints_json_arguments() -> None:
     assert event is not None
     assert event.kind == "tool"
     assert event.starts_stream is True
-    assert "Call ID: call-1" in event.text
-    assert '"path": "a.py"' in event.text
+    assert event.text.startswith("read  a.py")
+    assert "Call ID" not in event.text
+    assert '"path"' not in event.text
 
 
 def test_tool_stream_and_result_keep_all_public_details() -> None:
@@ -84,21 +83,52 @@ def test_tool_stream_and_result_keep_all_public_details() -> None:
         state=state,
     )
 
-    assert call is not None and "provider" in call.text
+    assert call is not None and "read" in call.text
     assert part is not None and part.streaming is True
     assert part.replaces_stream is True
-    assert "read\nCall ID: call-1" in part.text
-    assert '"path": "a.py"' in part.text
+    assert part.text.startswith("read  a.py")
+    assert "Call ID" not in part.text
     assert result is not None and result.kind == "tool_result"
-    for detail in (
-        "read · succeeded",
-        "Call ID: call-1",
-        "Message:\nsuccess",
-        "Display:\nread a.py",
-        "Output:\nlong internal output",
-        '"bytes": 20',
-    ):
-        assert detail in result.text
+    assert "a.py" in result.text
+    assert "long internal output" in result.text
+    assert "Call ID" not in result.text
+    assert "Message:" not in result.text
+    assert "Display:" not in result.text
+    assert "Output:" not in result.text
+
+
+def test_grep_and_todo_calls_are_human_readable() -> None:
+    grep = render_wire_message(
+        ToolCall(
+            id="g1",
+            function=ToolCall.FunctionBody(
+                name="grep",
+                arguments='{"pattern":"def foo","path":"src","include":"*.py"}',
+            ),
+        )
+    )
+    todo = render_wire_message(
+        ToolCall(
+            id="t1",
+            function=ToolCall.FunctionBody(
+                name="todo_write",
+                arguments=(
+                    '{"todos":[{"content":"Implement","status":"in_progress"},'
+                    '{"content":"Verify","status":"pending"}]}'
+                ),
+            ),
+        )
+    )
+
+    assert grep is not None
+    assert grep.text.startswith("grep  def foo")
+    assert "src" in grep.text
+    assert "*.py" in grep.text
+    assert '"pattern"' not in grep.text
+    assert todo is not None
+    assert "[>] Implement" in todo.text
+    assert "[ ] Verify" in todo.text
+    assert '"status"' not in todo.text
 
 
 def test_native_display_blocks_include_diff_and_todo_details() -> None:
@@ -173,7 +203,8 @@ def test_status_includes_tokens_message_and_mcp_details() -> None:
     assert "context 2,000/20,000" in text
     assert "tokens in 950 (new 100, cache read 800, cache write 50)" in text
     assert "out 75" in text
-    assert "message msg-1" in text
+    assert "message msg-1" not in text
+    assert "message" not in text
     assert "MCP 1/2 ready, 8 tools [github:connected]" in text
 
 
@@ -203,21 +234,3 @@ def test_step_event_is_visible() -> None:
 
     assert event is not None
     assert event.text == "Step 3"
-
-
-def test_truncate_display_keeps_prefix_only() -> None:
-    assert truncate_display("short") == "short"
-    clipped = truncate_display("x" * 50, limit=10)
-    assert clipped.startswith("xxxxxxxxxx")
-    assert "40 more chars" in clipped
-    assert len(clipped) < 50
-
-
-def test_bounded_concat_does_not_grow_past_limit() -> None:
-    assert bounded_concat("", "hello") == "hello"
-    assert bounded_concat("he", "llo") == "hello"
-    clipped = bounded_concat("abc", "defghij", limit=5)
-    assert clipped.startswith("abcde")
-    assert "truncated" in clipped
-    already = bounded_concat("abcde", "zzz", limit=5)
-    assert already == "abcde"

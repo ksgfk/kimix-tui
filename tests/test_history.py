@@ -19,8 +19,10 @@ from kimi_agent_sdk import (
 from kimix_tui.history import (
     HistoryAccumulator,
     HistoryBlock,
+    Timeline,
     _scan_wire_history_index,
     blocks_from_wire_messages,
+    create_timeline,
     load_session_history,
     load_wire_history_page,
     take_last_turns,
@@ -197,6 +199,48 @@ async def test_indexed_history_pages_read_only_requested_turns(tmp_path: Path) -
     assert [block.text for block in older.blocks if block.kind == "user"] == ["q2", "q3"]
 
 
+async def test_indexed_history_page_keeps_user_turns_when_block_cap_hits(
+    tmp_path: Path,
+) -> None:
+    from kimi_cli.wire.file import WireFile
+
+    wire_file = WireFile(tmp_path / "verbose-wire.jsonl")
+    await wire_file.open()
+    try:
+        for index in range(4):
+            await wire_file.append_message(TurnBegin(user_input=f"q{index}"))
+            for _ in range(20):
+                await wire_file.append_message(StepInterrupted())
+            await wire_file.append_message(TextPart(text=f"a{index}"))
+            await wire_file.append_message(TurnEnd())
+    finally:
+        await wire_file.close()
+
+    wire_index = _scan_wire_history_index(wire_file.path)
+    page = await load_wire_history_page(
+        wire_index,
+        end_turn=4,
+        page_turns=4,
+        max_blocks=8,
+    )
+
+    assert page.start_turn == 0
+    assert page.end_turn == 4
+    assert page.has_older is False
+    assert [block.text for block in page.blocks if block.kind == "user"] == [
+        "q0",
+        "q1",
+        "q2",
+        "q3",
+    ]
+    assert [block.text for block in page.blocks if block.kind == "assistant"] == [
+        "a0",
+        "a1",
+        "a2",
+        "a3",
+    ]
+
+
 async def test_indexed_history_disables_json_string_cache(
     tmp_path: Path,
     monkeypatch,
@@ -262,11 +306,12 @@ def test_history_keeps_streamed_tool_arguments_and_detailed_result() -> None:
     )
 
     assert [block.kind for block in blocks] == ["user", "tool", "tool_result"]
-    assert "Arguments:" in blocks[1].text
-    assert '"path": "a.py"' in blocks[1].text
-    assert "read · succeeded" in blocks[2].text
-    assert "Display:\nread a.py" in blocks[2].text
-    assert "Output:\ncontents" in blocks[2].text
+    assert blocks[1].text.startswith("read  a.py")
+    assert "Arguments:" not in blocks[1].text
+    assert "a.py" in blocks[2].text
+    assert "contents" in blocks[2].text
+    assert "Display:" not in blocks[2].text
+    assert "Output:" not in blocks[2].text
 
 
 def test_accumulator_discards_turns_outside_the_window() -> None:
@@ -281,7 +326,7 @@ def test_accumulator_discards_turns_outside_the_window() -> None:
     assert [block.text for block in history.blocks] == ["q3", "a3", "q4", "a4"]
 
 
-def test_accumulator_caps_retained_blocks() -> None:
+def test_accumulator_caps_auxiliary_blocks_but_keeps_dialogue() -> None:
     accumulator = HistoryAccumulator(max_turns=10, max_blocks=3)
     accumulator.feed(TurnBegin(user_input="question"))
     for _ in range(8):
@@ -289,5 +334,195 @@ def test_accumulator_caps_retained_blocks() -> None:
 
     history = accumulator.finish()
 
-    assert len(history.blocks) == 3
-    assert all(block.kind == "error" for block in history.blocks)
+    assert [block.kind for block in history.blocks] == ["user", "error", "error"]
+    assert history.blocks[0].text == "question"
+
+
+def test_accumulator_block_cap_keeps_user_turns_on_verbose_pages() -> None:
+    accumulator = HistoryAccumulator(max_turns=0, max_blocks=8)
+    for index in range(4):
+        accumulator.feed(TurnBegin(user_input=f"q{index}"))
+        for _ in range(20):
+            accumulator.feed(StepInterrupted())
+        accumulator.feed(TextPart(text=f"a{index}"))
+
+    history = accumulator.finish()
+
+    assert [block.text for block in history.blocks if block.kind == "user"] == [
+        "q0",
+        "q1",
+        "q2",
+        "q3",
+    ]
+    assert [block.text for block in history.blocks if block.kind == "assistant"] == [
+        "a0",
+        "a1",
+        "a2",
+        "a3",
+    ]
+    assert [block.kind for block in history.blocks] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+
+
+def _turn_blocks(count: int) -> list[list[HistoryBlock]]:
+    return [
+        [HistoryBlock("user", f"q{index}"), HistoryBlock("assistant", f"a{index}")]
+        for index in range(count)
+    ]
+
+
+def test_timeline_from_turn_blocks_exposes_display_items() -> None:
+    timeline = Timeline.from_turn_blocks(_turn_blocks(3))
+
+    assert timeline.total_turns == 3
+    assert timeline.materialized_turn_count == 3
+    assert timeline.display_items() == [
+        ("user", "q0", 0),
+        ("assistant", "a0", 0),
+        ("user", "q1", 1),
+        ("assistant", "a1", 1),
+        ("user", "q2", 2),
+        ("assistant", "a2", 2),
+    ]
+    assert timeline.turn_at_line(0) == 0
+    assert timeline.turn_at_line(timeline.first_line_of_turn(2)) == 2
+    assert timeline.virtual_lines() > 0
+
+
+async def test_timeline_unload_distant_drops_turns_outside_window() -> None:
+    timeline = Timeline.from_turn_blocks(_turn_blocks(8))
+
+    timeline.unload_distant(keep_turn=7, radius=1)
+
+    assert timeline.stubs_for_turn(0) is None
+    assert timeline.stubs_for_turn(5) is None
+    assert timeline.stubs_for_turn(6)[0].body == "q6"
+    assert timeline.stubs_for_turn(7)[0].body == "q7"
+    assert [text for kind, text, _turn in timeline.display_items() if kind == "user"] == ["q6", "q7"]
+
+    await timeline.materialize_turns(0, 1, hydrate=True)
+
+    assert timeline.stubs_for_turn(0)[0].body == "q0"
+    assert timeline.stubs_for_turn(0)[1].body == "a0"
+
+
+async def test_timeline_slide_to_keeps_only_window_and_skips_the_gap() -> None:
+    timeline = Timeline.from_turn_blocks(_turn_blocks(20))
+
+    await timeline.slide_to(0)
+
+    assert timeline.first_materialized_turn() == 0
+    assert timeline.last_materialized_turn() == 3
+    assert timeline.materialized_turn_count == 4
+    assert timeline.stubs_for_turn(19) is None
+    users = [text for kind, text, _turn in timeline.display_items() if kind == "user"]
+    assert users == ["q0", "q1", "q2", "q3"]
+    assert all(stub.body is not None for stub in timeline.iter_materialized_stubs())
+
+    await timeline.slide_to(19)
+
+    assert timeline.stubs_for_turn(0) is None
+    assert timeline.first_materialized_turn() == 16
+    assert timeline.last_materialized_turn() == 19
+    assert timeline.stubs_for_turn(19)[0].body == "q19"
+    users = [text for kind, text, _turn in timeline.display_items() if kind == "user"]
+    assert users == ["q16", "q17", "q18", "q19"]
+
+
+async def test_timeline_ensure_turn_materializes_neighbors_and_drops_far_turns() -> None:
+    timeline = Timeline.from_turn_blocks(_turn_blocks(10))
+    timeline.unload_distant(keep_turn=9, radius=0)
+    assert timeline.stubs_for_turn(0) is None
+
+    await timeline.ensure_turn(0, radius=1)
+
+    assert timeline.stubs_for_turn(0)[0].body == "q0"
+    assert timeline.stubs_for_turn(1)[0].body == "q1"
+    assert timeline.stubs_for_turn(9) is None
+
+
+async def test_timeline_open_eager_hydrates_all_small_logs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KIMI_SHARE_DIR", str(tmp_path / "share"))
+    from kaos.path import KaosPath
+    from kimi_cli.session import Session as CliSession
+
+    work_dir = tmp_path / "project"
+    kaos_dir = KaosPath.unsafe_from_local_path(work_dir.resolve()).canonical()
+    session = await CliSession.create(kaos_dir, "tl-small")
+    await session.wire_file.open()
+    try:
+        for index in range(5):
+            await session.wire_file.append_message(TurnBegin(user_input=f"q{index}"))
+            await session.wire_file.append_message(TextPart(text=f"a{index}"))
+            await session.wire_file.append_message(TurnEnd())
+    finally:
+        await session.wire_file.close()
+
+    timeline = await create_timeline(work_dir, session.id)
+
+    assert timeline is not None
+    assert timeline.total_turns == 5
+    assert timeline.materialized_turn_count == 5
+    assert [text for kind, text, _turn in timeline.display_items() if kind == "user"] == [
+        "q0",
+        "q1",
+        "q2",
+        "q3",
+        "q4",
+    ]
+
+
+async def test_timeline_open_hydrates_last_turns_for_large_logs(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import kimix_tui.history as history_module
+
+    monkeypatch.setenv("KIMI_SHARE_DIR", str(tmp_path / "share"))
+    monkeypatch.setattr(history_module, "EAGER_FILE_SIZE", 0)
+    from kaos.path import KaosPath
+    from kimi_cli.session import Session as CliSession
+
+    work_dir = tmp_path / "project"
+    kaos_dir = KaosPath.unsafe_from_local_path(work_dir.resolve()).canonical()
+    session = await CliSession.create(kaos_dir, "tl-large")
+    await session.wire_file.open()
+    try:
+        for index in range(6):
+            await session.wire_file.append_message(TurnBegin(user_input=f"q{index}"))
+            await session.wire_file.append_message(TextPart(text=f"a{index}"))
+            await session.wire_file.append_message(TurnEnd())
+    finally:
+        await session.wire_file.close()
+
+    timeline = await create_timeline(work_dir, session.id)
+
+    assert timeline is not None
+    assert timeline.total_turns == 6
+    assert timeline.materialized_turn_count == history_module.INITIAL_HYDRATE_TURNS
+    assert timeline.first_materialized_turn() == 3
+    assert timeline.stubs_for_turn(0) is None
+    assert [stub.text for stub in timeline.stubs_for_turn(5) or [] if stub.kind == "user"] == [
+        "q5"
+    ]
+
+    await timeline.ensure_turn(0)
+
+    assert timeline.stubs_for_turn(0) is not None
+    assert timeline.stubs_for_turn(0)[0].body == "q0"
+    assert timeline.stubs_for_turn(5) is None
+    assert timeline.last_materialized_turn() == 3
+    users = [text for kind, text, _turn in timeline.display_items() if kind == "user"]
+    assert users == ["q0", "q1", "q2", "q3"]
+

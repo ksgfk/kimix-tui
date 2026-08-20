@@ -1,4 +1,4 @@
-"""Replay recent session history from the kimi-cli wire log."""
+"""Session timeline: wire.jsonl → TurnIndex → sliding hydrated window."""
 
 from __future__ import annotations
 
@@ -13,17 +13,23 @@ from kaos.path import KaosPath
 
 from kimix_tui.rendering import (
     RenderState,
-    bounded_concat,
     render_wire_message,
-    truncate_display,
     user_input_text,
 )
-from kimix_tui.transcript_paint import is_dialogue_record
+from kimix_tui.transcript_paint import default_expanded, is_compact_record, is_dialogue_record
 
+# Legacy paging caps. Chat no longer windows history with these; they remain
+# for the memory-diagnosis script and injected HistoryLoader tests.
 MAX_HISTORY_TURNS = 4
 MAX_HISTORY_BLOCKS = 32
 HISTORY_PAGE_TURNS = MAX_HISTORY_TURNS
 MAX_HISTORY_WINDOW_TURNS = 64
+
+HYDRATED_BODY_BUDGET = 6 * 1024 * 1024
+EAGER_FILE_SIZE = 8 * 1024 * 1024
+INITIAL_HYDRATE_TURNS = 3
+WINDOW_RADIUS = INITIAL_HYDRATE_TURNS
+UNMATERIALIZED_TURN_LINES = 6
 _SKIP_RENDER_KINDS = {"status"}
 _TURN_BEGIN_RECORD = re.compile(
     rb'"message"\s*:\s*\{\s*"type"\s*:\s*"TurnBegin"\s*,\s*"payload"\s*:'
@@ -68,6 +74,359 @@ class WireHistoryIndex:
     @property
     def total_turns(self) -> int:
         return len(self.turn_offsets)
+
+
+TurnIndex = WireHistoryIndex
+
+
+@dataclass(slots=True)
+class RecordStub:
+    """One timeline row: cheap metadata plus an optional hydrated body."""
+
+    kind: str
+    turn: int
+    summary: str
+    estimated_lines: int
+    body: str | None = None
+
+    @property
+    def hydrated(self) -> bool:
+        return self.body is not None
+
+    @property
+    def text(self) -> str:
+        return self.body or ""
+
+
+def estimate_stub_lines(kind: str, text: str, *, expanded: bool | None = None, width: int = 80) -> int:
+    """Conservative line count matching Transcript estimates."""
+
+    if expanded is None:
+        expanded = default_expanded(kind)
+    if is_compact_record(kind, expanded=expanded):
+        return 1
+    wrap_width = max(8, width - 2)
+    lines = text.split("\n") if text else [""]
+    body_lines = 0
+    for line in lines:
+        cells = max(1, len(line))
+        body_lines += max(1, (cells + wrap_width - 1) // wrap_width)
+    return 1 + body_lines + 1
+
+
+def stub_from_block(block: HistoryBlock, turn: int, *, hydrate: bool = True) -> RecordStub:
+    """Fold one history block into a timeline stub."""
+
+    body = block.text if hydrate else None
+    return RecordStub(
+        kind=block.kind,
+        turn=turn,
+        summary="",
+        estimated_lines=estimate_stub_lines(block.kind, block.text),
+        body=body,
+    )
+
+
+@dataclass(slots=True)
+class Timeline:
+    """Sliding window over an indexed wire log or in-memory turns."""
+
+    index: WireHistoryIndex | None = None
+    hydrated_budget: int = HYDRATED_BODY_BUDGET
+    wrap_width: int = 80
+    _turns: list[list[RecordStub] | None] = field(default_factory=list)
+    _source_blocks: list[list[HistoryBlock]] | None = None
+
+    @classmethod
+    def from_turn_blocks(cls, turns: Sequence[Sequence[HistoryBlock]]) -> Timeline:
+        """Build a fully materialized in-memory timeline (tests / fakes)."""
+
+        timeline = cls()
+        source = [list(turn) for turn in turns]
+        timeline._source_blocks = source
+        timeline._turns = [
+            [stub_from_block(block, turn_index) for block in turn]
+            for turn_index, turn in enumerate(source)
+        ]
+        return timeline
+
+    @property
+    def total_turns(self) -> int:
+        if self.index is not None:
+            return self.index.total_turns
+        return len(self._turns)
+
+    @property
+    def materialized_turn_count(self) -> int:
+        return sum(1 for turn in self._turns if turn is not None)
+
+    def has_older_unmaterialized(self, first_materialized: int) -> bool:
+        return first_materialized > 0
+
+    def turn_range(self, turn: int) -> tuple[int, int]:
+        """Byte range for a 0-based turn, or (0, 0) for in-memory timelines."""
+
+        index = self.index
+        if index is None or not index.turn_offsets:
+            return 0, 0
+        turn = max(0, min(turn, index.total_turns - 1))
+        start = index.turn_offsets[turn]
+        end = index.file_size if turn + 1 >= index.total_turns else index.turn_offsets[turn + 1]
+        return start, end
+
+    def stubs_for_turn(self, turn: int) -> list[RecordStub] | None:
+        if turn < 0 or turn >= len(self._turns):
+            return None
+        return self._turns[turn]
+
+    def iter_materialized_stubs(self) -> list[RecordStub]:
+        stubs: list[RecordStub] = []
+        for turn in self._turns:
+            if turn is not None:
+                stubs.extend(turn)
+        return stubs
+
+    def display_items(self) -> list[tuple[str, str, int]]:
+        """Kind, full text, and 0-based turn for the current sliding window."""
+
+        return [
+            (stub.kind, stub.body, stub.turn)
+            for stub in self.iter_materialized_stubs()
+            if stub.body is not None
+        ]
+
+    def first_materialized_turn(self) -> int:
+        for index, turn in enumerate(self._turns):
+            if turn is not None:
+                return index
+        return 0
+
+    def last_materialized_turn(self) -> int:
+        last = -1
+        for index, turn in enumerate(self._turns):
+            if turn is not None:
+                last = index
+        return last
+
+    def virtual_lines(self) -> int:
+        """Scrollbar height: unmaterialized estimates + materialized stub heights."""
+
+        total = 0
+        expected = self.total_turns
+        for turn_index in range(expected):
+            turn = self._turns[turn_index] if turn_index < len(self._turns) else None
+            if turn is None:
+                total += UNMATERIALIZED_TURN_LINES
+            else:
+                total += sum(max(1, stub.estimated_lines) for stub in turn)
+        return total
+
+    def first_line_of_turn(self, turn: int) -> int:
+        turn = max(0, min(turn, max(0, self.total_turns - 1)))
+        line = 0
+        for turn_index in range(turn):
+            rows = self._turns[turn_index] if turn_index < len(self._turns) else None
+            if rows is None:
+                line += UNMATERIALIZED_TURN_LINES
+            else:
+                line += sum(max(1, stub.estimated_lines) for stub in rows)
+        return line
+
+    def turn_at_line(self, line: int) -> int:
+        if self.total_turns <= 0:
+            return 0
+        remaining = max(0, line)
+        for turn_index in range(self.total_turns):
+            rows = self._turns[turn_index] if turn_index < len(self._turns) else None
+            height = (
+                UNMATERIALIZED_TURN_LINES
+                if rows is None
+                else sum(max(1, stub.estimated_lines) for stub in rows)
+            )
+            if remaining < height:
+                return turn_index
+            remaining -= height
+        return self.total_turns - 1
+
+    def hydrated_chars(self) -> int:
+        total = 0
+        for turn in self._turns:
+            if turn is None:
+                continue
+            for stub in turn:
+                if stub.body is not None:
+                    total += len(stub.body)
+        return total
+
+    async def open(self) -> None:
+        """Materialize enough history for an IM-style latest view."""
+
+        total = self.total_turns
+        if total <= 0:
+            if self.index is not None and self.index.file_size > 0:
+                await self._materialize_byte_range(0, self.index.file_size, start_turn=0)
+            else:
+                self._turns = []
+            return
+        self._ensure_turn_slots(total)
+        eager = self.index is None or self.index.file_size <= EAGER_FILE_SIZE
+        if eager:
+            await self.materialize_turns(0, total, hydrate=True)
+            return
+        start = max(0, total - INITIAL_HYDRATE_TURNS)
+        await self.materialize_turns(start, total, hydrate=True)
+
+    async def materialize_turns(
+        self,
+        start: int,
+        end: int,
+        *,
+        hydrate: bool = True,
+    ) -> int:
+        """Parse ``[start, end)`` into stubs. Return newly materialized turn count."""
+
+        total = self.total_turns
+        start = max(0, min(start, total))
+        end = max(start, min(end, total))
+        self._ensure_turn_slots(total)
+        missing = [turn for turn in range(start, end) if self._turns[turn] is None]
+        if not missing:
+            if hydrate:
+                self.hydrate_turns(start, end)
+            return 0
+        added = 0
+        if self._source_blocks is not None:
+            for turn in missing:
+                blocks = self._source_blocks[turn]
+                self._turns[turn] = [
+                    stub_from_block(block, turn, hydrate=hydrate) for block in blocks
+                ]
+                added += 1
+            return added
+        if self.index is None:
+            return 0
+        run_start = missing[0]
+        run_end = missing[-1] + 1
+        start_offset, _ = self.turn_range(run_start)
+        _, end_offset = self.turn_range(run_end - 1)
+        await self._materialize_byte_range(
+            start_offset,
+            end_offset,
+            start_turn=run_start,
+            hydrate=hydrate,
+        )
+        return sum(1 for turn in missing if self._turns[turn] is not None)
+
+    def window_bounds(self, keep_turn: int, radius: int = WINDOW_RADIUS) -> tuple[int, int]:
+        """Inclusive-start, exclusive-end turn range around ``keep_turn``."""
+
+        total = self.total_turns
+        if total <= 0:
+            return 0, 0
+        keep = max(0, min(keep_turn, total - 1))
+        start = max(0, keep - radius)
+        end = min(total, keep + radius + 1)
+        return start, end
+
+    def drop_outside_window(self, *, keep_turn: int, radius: int = WINDOW_RADIUS) -> None:
+        """Drop turns outside the window. Does not leave summary stubs."""
+
+        if self.total_turns <= 0:
+            return
+        keep_start, keep_end = self.window_bounds(keep_turn, radius)
+        for turn_index, rows in enumerate(self._turns):
+            if rows is not None and not keep_start <= turn_index < keep_end:
+                self._turns[turn_index] = None
+
+    async def slide_to(self, turn: int, *, radius: int = WINDOW_RADIUS) -> None:
+        """Keep only ``turn ± radius``, fully hydrated. Never parse the gap."""
+
+        total = self.total_turns
+        if total <= 0:
+            return
+        turn = max(0, min(turn, total - 1))
+        self.drop_outside_window(keep_turn=turn, radius=radius)
+        start, end = self.window_bounds(turn, radius)
+        await self.materialize_turns(start, end, hydrate=True)
+
+    async def ensure_turn(self, turn: int, *, radius: int = WINDOW_RADIUS) -> None:
+        """Slide the hydrated window so ``turn`` is inside it."""
+
+        await self.slide_to(turn, radius=radius)
+
+    def hydrate_turns(self, start: int, end: int) -> None:
+        """Restore bodies for already materialized turns from in-memory sources."""
+
+        if self._source_blocks is None:
+            return
+        for turn_index in range(max(0, start), min(end, len(self._turns))):
+            rows = self._turns[turn_index]
+            source = self._source_blocks[turn_index]
+            if rows is None:
+                continue
+            for stub, block in zip(rows, source, strict=False):
+                if stub.body is None:
+                    stub.body = block.text
+
+    async def rehydrate_turns(self, start: int, end: int) -> None:
+        """Restore bodies for ``[start, end)`` from memory or the wire log."""
+
+        start = max(0, start)
+        end = min(end, self.total_turns)
+        if self._source_blocks is not None:
+            self.hydrate_turns(start, end)
+            return
+        if self.index is None:
+            return
+        for turn_index in range(start, end):
+            rows = self._turns[turn_index]
+            if rows is None or all(stub.body is not None for stub in rows):
+                continue
+            start_offset, end_offset = self.turn_range(turn_index)
+            blocks = await asyncio.to_thread(
+                _read_wire_history_range,
+                self.index.path,
+                start_offset,
+                end_offset,
+                max_blocks=0,
+            )
+            for stub, block in zip(rows, blocks, strict=False):
+                stub.body = block.text
+
+    def unload_distant(self, *, keep_turn: int, radius: int = WINDOW_RADIUS) -> None:
+        """Drop turns outside ``keep_turn ± radius`` (alias of drop_outside_window)."""
+
+        self.drop_outside_window(keep_turn=keep_turn, radius=radius)
+
+
+    def _ensure_turn_slots(self, total: int) -> None:
+        if len(self._turns) < total:
+            self._turns.extend([None] * (total - len(self._turns)))
+
+    async def _materialize_byte_range(
+        self,
+        start_offset: int,
+        end_offset: int,
+        *,
+        start_turn: int,
+        hydrate: bool = True,
+    ) -> None:
+        if self.index is None:
+            return
+        turns = await asyncio.to_thread(
+            _read_wire_turns,
+            self.index.path,
+            start_offset,
+            end_offset,
+        )
+        self._ensure_turn_slots(max(self.total_turns, start_turn + len(turns)))
+        for offset, blocks in enumerate(turns):
+            turn_index = start_turn + offset
+            if turn_index >= len(self._turns):
+                break
+            self._turns[turn_index] = [
+                stub_from_block(block, turn_index, hydrate=hydrate) for block in blocks
+            ]
 
 
 @dataclass(slots=True)
@@ -119,14 +478,15 @@ class WireHistoryPager:
 
 @dataclass
 class HistoryAccumulator:
-    """Fold wire messages into a bounded last-N-turns window.
+    """Fold wire messages into transcript blocks.
 
     Dialogue text is retained in full; auxiliary records use the display bound
-    so a verbose tool event cannot dominate a history page.
+    so a verbose tool event cannot dominate a row. Turn/block caps are optional
+    and unused by the continuous timeline.
     """
 
-    max_turns: int = MAX_HISTORY_TURNS
-    max_blocks: int = MAX_HISTORY_BLOCKS
+    max_turns: int = 0
+    max_blocks: int = 0
     omitted_turns: int = 0
     _turns: deque[list[HistoryBlock]] = field(default_factory=deque)
     _current: list[HistoryBlock] = field(default_factory=list)
@@ -161,45 +521,50 @@ class HistoryAccumulator:
         blocks = [block for turn in self._turns for block in turn]
         return SessionHistory(blocks=blocks, omitted_turns=self.omitted_turns)
 
+    def finish_turns(self) -> list[list[HistoryBlock]]:
+        self._flush_turn()
+        return [list(turn) for turn in self._turns]
+
     def _add(self, kind: str, text: str, *, merge: bool, replace: bool = False) -> None:
         if replace and self._current and self._current[-1].kind == kind:
-            self._current[-1] = HistoryBlock(
-                kind,
-                text if is_dialogue_record(kind) else truncate_display(text),
-            )
+            self._current[-1] = HistoryBlock(kind, text)
             return
         if merge and self._current and self._current[-1].kind == kind:
             previous = self._current[-1]
-            self._current[-1] = HistoryBlock(
-                kind,
-                previous.text + text
-                if is_dialogue_record(kind)
-                else bounded_concat(previous.text, text),
-            )
+            self._current[-1] = HistoryBlock(kind, previous.text + text)
             return
-        self._current.append(
-            HistoryBlock(
-                kind,
-                text if is_dialogue_record(kind) else bounded_concat("", text),
-            )
-        )
+        self._current.append(HistoryBlock(kind, text))
         self._block_count += 1
         self._trim_blocks()
 
     def _trim_blocks(self) -> None:
-        """Keep the accumulator bounded even before the current turn closes."""
+        """Drop oldest auxiliary records; never discard user/assistant dialogue."""
 
         if self.max_blocks <= 0:
             return
         while self._block_count > self.max_blocks:
-            if self._turns:
-                self._block_count -= len(self._turns.popleft())
-                continue
-            if self._current:
-                self._current.pop(0)
+            if not self._drop_oldest_auxiliary_block():
+                return
+
+    def _drop_oldest_auxiliary_block(self) -> bool:
+        """Remove the oldest non-dialogue block. Return False if only dialogue remains."""
+
+        for turn_index, turn in enumerate(self._turns):
+            for block_index, block in enumerate(turn):
+                if is_dialogue_record(block.kind):
+                    continue
+                del turn[block_index]
                 self._block_count -= 1
+                if not turn:
+                    del self._turns[turn_index]
+                return True
+        for block_index, block in enumerate(self._current):
+            if is_dialogue_record(block.kind):
                 continue
-            break
+            del self._current[block_index]
+            self._block_count -= 1
+            return True
+        return False
 
     def _flush_turn(self) -> None:
         if not self._current:
@@ -259,6 +624,21 @@ def _scan_wire_history_index(path: Path) -> WireHistoryIndex:
     )
 
 
+async def create_timeline(work_dir: Path, session_id: str) -> Timeline | None:
+    """Open and index a session's wire log as a continuous timeline."""
+
+    from kimi_cli.session import Session as CliSession
+
+    kaos_dir = KaosPath.unsafe_from_local_path(Path(work_dir).resolve()).canonical()
+    cli_session = await CliSession.find(kaos_dir, session_id)
+    if cli_session is None:
+        return None
+    index = await asyncio.to_thread(_scan_wire_history_index, cli_session.wire_file.path)
+    timeline = Timeline(index=index)
+    await timeline.open()
+    return timeline
+
+
 async def create_history_pager(
     work_dir: Path,
     session_id: str,
@@ -290,6 +670,19 @@ def _read_wire_history_range(
     max_blocks: int,
 ) -> list[HistoryBlock]:
     """Parse one bounded byte range and discard raw records as they are folded."""
+
+    turns = _read_wire_turns(path, start_offset, end_offset, max_blocks=max_blocks)
+    return [block for turn in turns for block in turn]
+
+
+def _read_wire_turns(
+    path: Path,
+    start_offset: int,
+    end_offset: int,
+    *,
+    max_blocks: int = 0,
+) -> list[list[HistoryBlock]]:
+    """Parse one bounded byte range into per-turn block lists."""
 
     from kimi_cli.wire.file import WireFileMetadata, WireMessageRecord
     from pydantic_core import from_json
@@ -329,7 +722,7 @@ def _read_wire_history_range(
                     continue
     except OSError:
         return []
-    return accumulator.finish().blocks
+    return accumulator.finish_turns()
 
 
 async def load_wire_history_page(

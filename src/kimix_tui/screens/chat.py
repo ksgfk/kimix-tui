@@ -11,8 +11,9 @@ from textual import events, on, work
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
+from textual.css.query import NoMatches
 from textual.screen import Screen
-from textual.widgets import Button, Footer, Header, Input, Static
+from textual.widgets import Button, Footer, Input, Label, Static
 
 from kimix_tui.backend import (
     SdkSession,
@@ -21,18 +22,15 @@ from kimix_tui.backend import (
     create_sdk_session,
 )
 from kimix_tui.history import (
-    HISTORY_PAGE_TURNS,
-    MAX_HISTORY_BLOCKS,
-    MAX_HISTORY_WINDOW_TURNS,
     HistoryLoader,
     SessionHistory,
-    WireHistoryPager,
-    create_history_pager,
+    Timeline,
+    create_timeline,
 )
 from kimix_tui.rendering import RenderEvent, RenderState, format_status, render_wire_message
 from kimix_tui.screens.requests import ApprovalScreen, QuestionScreen
 from kimix_tui.screens.settings import OpenLLMSettings
-from kimix_tui.widgets import Transcript
+from kimix_tui.widgets import PromptInput, Transcript
 
 SessionFactory = Callable[[SessionOptions], Awaitable[SdkSession]]
 SessionOpenedCallback = Callable[[str], None]
@@ -47,66 +45,88 @@ class ChatScreen(Screen[None]):
         background: $background;
     }
 
-    #status {
+    #chat-toolbar, #history-toolbar {
         height: 1;
-        padding: 0 3;
+        padding: 0 1;
+        align: left middle;
+        background: $surface;
+    }
+
+    #chat-title {
+        width: auto;
+        height: 1;
+        padding: 0 1 0 0;
+        text-style: bold;
+        color: $accent;
+        content-align: left middle;
+    }
+
+    #status {
+        width: 1fr;
+        height: 1;
+        padding: 0 1;
         color: $text-muted;
-        background: $panel;
+        content-align: left middle;
         text-wrap: nowrap;
         text-overflow: ellipsis;
     }
 
-    #history-toolbar {
-        display: none;
-        height: 3;
-        padding: 0 3;
+    #chat-actions, #history-actions {
+        width: auto;
+        height: 1;
+        align: right middle;
+    }
+
+    #chat-toolbar Button, #history-toolbar Button {
+        height: 1;
+        min-height: 1;
+        width: auto;
+        min-width: 0;
+        margin: 0 0 0 1;
+        padding: 0 1;
+        border: none;
         background: $surface;
-        border-bottom: solid $panel-lighten-1;
-        align: left middle;
+        color: $text-muted;
+    }
+
+    #chat-toolbar Button:hover, #history-toolbar Button:hover {
+        background: $boost;
+        color: $text;
+    }
+
+    #chat-toolbar Button:focus, #history-toolbar Button:focus {
+        background: $boost;
+        color: $accent;
+        text-style: bold;
+    }
+
+    #leave-session {
+        color: $text;
     }
 
     #history-info {
         width: 1fr;
-        height: 3;
+        height: 1;
         color: $text-muted;
         content-align: left middle;
         text-wrap: nowrap;
         text-overflow: ellipsis;
     }
 
-    #history-actions {
-        width: auto;
-        height: 3;
-        align: right middle;
-    }
-
-    #history-actions Button {
-        height: 3;
-        min-width: 13;
-        margin-left: 1;
-    }
-
     #history-turn {
-        width: 10;
-        min-width: 8;
-        height: 3;
-        margin-left: 1;
+        width: 8;
+        min-width: 6;
+        height: 1;
+        margin: 0 0 0 1;
         padding: 0 1;
         content-align: left middle;
-        border: tall $panel-lighten-1;
-        background: $panel;
+        border: none;
+        background: $boost;
     }
 
     #history-turn:focus {
-        border: tall $accent;
-    }
-
-    #jump-latest {
-        min-width: 10;
-    }
-
-    ChatScreen.-narrow #history-toolbar {
-        padding: 0 1;
+        background: $panel;
+        color: $accent;
     }
 
     ChatScreen.-narrow #history-info {
@@ -125,8 +145,8 @@ class ChatScreen(Screen[None]):
     }
 
     ChatScreen.-narrow #history-turn {
-        width: 8;
-        min-width: 6;
+        width: 6;
+        min-width: 4;
         padding: 0;
     }
 
@@ -139,22 +159,54 @@ class ChatScreen(Screen[None]):
 
     #prompt {
         dock: bottom;
+        width: 100%;
         height: 3;
+        min-height: 3;
+        max-height: 8;
         margin: 1 2;
         padding: 0 1;
         border: round $accent;
         background: $panel;
+        overflow-x: hidden;
+        scrollbar-size-vertical: 1;
+        scrollbar-size-horizontal: 0;
+    }
+
+    #chat-footer {
+        dock: bottom;
+        height: 1;
+        width: 100%;
+        align: left middle;
+        background: $footer-background;
+    }
+
+    #chat-footer Footer {
+        dock: none;
+        width: auto;
+        height: 1;
+        min-width: 0;
+    }
+
+    #context {
+        width: 1fr;
+        height: 1;
+        padding: 0 1;
+        color: $footer-description-foreground;
+        background: $footer-background;
+        content-align: right middle;
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
     }
     """
 
     BINDINGS: ClassVar[list[Binding]] = [
         Binding("ctrl+g", "cancel_prompt", "Cancel", priority=True),
-        Binding("ctrl+up", "load_older", "Earlier"),
-        Binding("ctrl+end", "jump_latest", "Latest"),
-        Binding("f2", "focus_prompt", "Prompt"),
-        Binding("f3", "focus_history_turn", "Turn"),
-        Binding("f4", "settings", "Settings"),
-        Binding("escape", "leave_session", "Home"),
+        Binding("ctrl+up", "load_older", "Earlier", show=False),
+        Binding("ctrl+end", "jump_latest", "Latest", show=False),
+        Binding("f2", "focus_prompt", "Prompt", show=False),
+        Binding("f3", "focus_history_turn", "Turn", show=False),
+        Binding("f4", "settings", "Settings", show=False),
+        Binding("escape", "leave_session", "Home", show=False),
     ]
 
     def __init__(
@@ -177,24 +229,26 @@ class ChatScreen(Screen[None]):
         self._pending_config_label: str | None = None
         self._render_state = RenderState()
         self._last_wire_status: str | None = None
-        self._history_pager: WireHistoryPager | None = None
-        self._history_start_turn = 0
-        self._history_end_turn = 0
+        self._timeline: Timeline | None = None
         self._history_total_turns = 0
         self._history_loading = False
         self._history_legacy_omitted = 0
 
     def compose(self) -> ComposeResult:
-        yield Header()
-        yield Static("connecting…", id="status")
+        with Horizontal(id="chat-toolbar"):
+            yield Label("CHAT", id="chat-title")
+            yield Static("connecting…", id="status", markup=False)
+            with Horizontal(id="chat-actions"):
+                yield Button("Settings", id="open-settings", compact=True)
+                yield Button("Home", id="leave-session", compact=True)
         with Horizontal(id="history-toolbar"):
-            yield Static("", id="history-info", markup=False)
+            yield Static("History · connecting…", id="history-info", markup=False)
             with Horizontal(id="history-actions"):
                 yield Button(
-                    "← Earlier",
+                    "←",
                     id="load-older",
                     compact=True,
-                    tooltip="Load earlier turns",
+                    tooltip="Previous turn",
                 )
                 yield Input(
                     placeholder="Turn #",
@@ -202,27 +256,36 @@ class ChatScreen(Screen[None]):
                     type="integer",
                     restrict=r"[0-9]*",
                     disabled=True,
-                    tooltip="Jump to turn",
+                    tooltip="Seek to turn",
                 )
                 yield Button(
-                    "Later →",
+                    "→",
                     id="load-newer",
                     compact=True,
                     disabled=True,
-                    tooltip="Load later turns",
+                    tooltip="Next turn",
                 )
                 yield Button(
-                    "↓ Latest",
+                    "↓",
                     id="jump-latest",
                     compact=True,
                     disabled=True,
-                    tooltip="Return to the latest turn",
+                    tooltip="Jump to latest",
                 )
         yield Transcript(id="transcript")
-        yield Input(placeholder="Ask AI, or type /help", id="prompt", disabled=True)
-        yield Footer()
+        yield PromptInput(
+            placeholder="Ask AI, or type /help",
+            id="prompt",
+            disabled=True,
+            tooltip="Enter to send · Ctrl+Enter for newline",
+        )
+        with Horizontal(id="chat-footer"):
+            yield Footer(show_command_palette=False, compact=True)
+            yield Static("", id="context", markup=False)
 
     def on_mount(self) -> None:
+        self.app.title = "Kimix"
+        self.app.sub_title = "Chat"
         self.open_session()
 
     def on_resize(self, event: events.Resize) -> None:
@@ -242,6 +305,15 @@ class ChatScreen(Screen[None]):
     def transcript(self) -> Transcript:
         return self.query_one("#transcript", Transcript)
 
+    def _mounted_transcript(self) -> Transcript | None:
+        """Return the transcript if this screen is still attached to the DOM."""
+
+        if not self.is_attached:
+            return None
+        with suppress(NoMatches):
+            return self.query_one("#transcript", Transcript)
+        return None
+
     @work(exclusive=True, group="session")
     async def open_session(self) -> None:
         epoch = self._chat_epoch
@@ -250,7 +322,7 @@ class ChatScreen(Screen[None]):
         except Exception as exc:  # noqa: BLE001 - keep UI alive on SDK startup errors
             if epoch != self._chat_epoch:
                 return
-            await self.transcript.append_block("error", f"Failed to open session: {exc}")
+            await self._append_transcript("error", f"Failed to open session: {exc}")
             self._set_status("session unavailable")
             return
         if epoch != self._chat_epoch:
@@ -261,13 +333,14 @@ class ChatScreen(Screen[None]):
             try:
                 self._on_session_opened(session.id)
             except Exception as exc:  # noqa: BLE001 - chat remains usable if metadata fails
-                await self.transcript.append_block(
+                await self._append_transcript(
                     "error", f"Failed to save session configuration metadata: {exc}"
                 )
-        self._set_status(f"session {session.id} · {format_status(session.status)}")
+        self._set_status(f"session {session.id}")
+        self._set_context(format_status(session.status))
         if epoch != self._chat_epoch:
             return
-        await self.transcript.append_block("system", f"Session: {session.id}")
+        await self._append_transcript("system", f"Session: {session.id}")
         if epoch != self._chat_epoch:
             return
         try:
@@ -281,23 +354,21 @@ class ChatScreen(Screen[None]):
         epoch = self._chat_epoch
         if session is None:
             return
-        pager: WireHistoryPager | None = None
+        timeline: Timeline | None = None
         if self._history_loader is None:
             self._history_loading = True
             self._update_history_toolbar()
         try:
             if self._history_loader is None:
-                pager = await create_history_pager(
+                timeline = await create_timeline(
                     self._options.work_dir,
                     session.id,
-                    page_turns=HISTORY_PAGE_TURNS,
-                    max_blocks=MAX_HISTORY_BLOCKS,
                 )
-                if pager is None:
+                if timeline is None:
                     self._history_loading = False
                     self._update_history_toolbar()
                     return
-                history = await pager.latest()
+                history = None
             else:
                 history = await self._history_loader(self._options.work_dir, session.id)
         except Exception as exc:  # noqa: BLE001 - chat still works without replay
@@ -310,8 +381,8 @@ class ChatScreen(Screen[None]):
         if epoch != self._chat_epoch or self._session is not session:
             return
         if self._history_loader is None:
-            self._history_pager = pager
-            await self._mount_history_page(history)
+            self._timeline = timeline
+            await self._mount_timeline()
             return
 
         self._reset_history_state()
@@ -330,119 +401,127 @@ class ChatScreen(Screen[None]):
         self._history_legacy_omitted = history.omitted_turns
         self._update_history_toolbar()
 
-    async def _mount_history_page(self, history: SessionHistory) -> None:
-        """Mount the initial bounded page and record its transcript slice."""
+    async def _mount_timeline(self) -> None:
+        """Mount materialized timeline rows after the session prefix."""
 
-        history_start = len(self.transcript.records)
-        if history.blocks:
-            await self.transcript.append_blocks(
-                [(block.kind, block.text) for block in history.blocks]
+        timeline = self._timeline
+        if timeline is None:
+            self._history_loading = False
+            self._update_history_toolbar()
+            return
+        items = timeline.display_items()
+        if items:
+            await self.transcript.replace_history_blocks(
+                [(kind, text, turn) for kind, text, turn in items]
             )
-        self.transcript.mark_history_window(history_start, len(self.transcript.records))
-        self._history_start_turn = history.start_turn
-        self._history_end_turn = history.end_turn
-        self._history_total_turns = history.total_turns
+        else:
+            self.transcript.mark_history_window()
+        self._history_total_turns = timeline.total_turns
         self._history_legacy_omitted = 0
         self._history_loading = False
+        self.transcript.jump_to_latest()
         self._update_history_toolbar()
 
     def _reset_history_state(self) -> None:
-        self._history_pager = None
-        self._history_start_turn = 0
-        self._history_end_turn = 0
+        self._timeline = None
         self._history_total_turns = 0
         self._history_loading = False
         self._history_legacy_omitted = 0
 
-    def _update_history_toolbar(self) -> None:
-        toolbar = self.query_one("#history-toolbar", Horizontal)
-        info = self.query_one("#history-info", Static)
-        older = self.query_one("#load-older", Button)
-        turn_input = self.query_one("#history-turn", Input)
-        newer = self.query_one("#load-newer", Button)
-        latest = self.query_one("#jump-latest", Button)
-        pager = self._history_pager
+    def _display_turn(self) -> int:
+        """1-based turn shown in the toolbar."""
 
-        if pager is None:
+        total = self._history_total_turns
+        transcript = self._mounted_transcript()
+        if transcript is None:
+            return total
+        if transcript.pinned_to_latest:
+            return total
+        viewport = transcript.viewport_turn()
+        if viewport is not None:
+            return viewport + 1
+        return total
+
+    def _update_history_toolbar(self) -> None:
+        if not self.is_attached:
+            return
+        try:
+            toolbar = self.query_one("#history-toolbar", Horizontal)
+            info = self.query_one("#history-info", Static)
+            older = self.query_one("#load-older", Button)
+            turn_input = self.query_one("#history-turn", Input)
+            newer = self.query_one("#load-newer", Button)
+            latest = self.query_one("#jump-latest", Button)
+        except NoMatches:
+            return
+        timeline = self._timeline
+        toolbar.display = True
+
+        if timeline is None:
             if self._history_loading:
-                toolbar.display = True
                 info.update("History · loading…")
-                older.disabled = True
-                turn_input.disabled = True
-                newer.disabled = True
-                latest.disabled = True
-                return
-            if self._history_legacy_omitted:
-                toolbar.display = True
+            elif self._history_legacy_omitted:
                 info.update(
                     f"History · {self._history_legacy_omitted} earlier turns unavailable"
                 )
             else:
-                toolbar.display = False
+                info.update("History · no turns yet")
             older.disabled = True
             turn_input.disabled = True
             newer.disabled = True
             latest.disabled = True
             return
 
-        total = self._history_total_turns
-        start = self._history_start_turn
-        end = self._history_end_turn
+        total = self._history_total_turns or timeline.total_turns
+        current = self._display_turn() if total else 0
         if total <= 0:
-            toolbar.display = False
+            info.update("History · no turns yet")
             older.disabled = True
             turn_input.disabled = True
             newer.disabled = True
             latest.disabled = True
             return
 
-        narrow = self.has_class("-narrow")
-        window_full = end - start >= MAX_HISTORY_WINDOW_TURNS and start > 0
-        details: list[str] = []
-        if start:
-            details.append(f"{start} older")
-        if total - end:
-            details.append(f"{total - end} newer")
-        if start == 0 and end == total:
-            range_text = f"all {total} turns"
-        else:
-            range_text = f"turns {start + 1}-{end} of {total}"
-        info.update("History · " + range_text + (f" · {' · '.join(details)}" if details else ""))
-        toolbar_visible = total > HISTORY_PAGE_TURNS or self._history_loading
-        toolbar.display = toolbar_visible
-        if narrow:
-            older.label = "←"
-            newer.label = "→"
-            latest.label = "↓"
-        else:
-            older.label = "← Earlier page" if window_full else "← Earlier"
-            newer.label = "Later →"
-            latest.label = "↓ Latest"
-        older.disabled = self._history_loading or start == 0
+        info.update(f"History · Turn {current} of {total}")
+        older.label = "←"
+        newer.label = "→"
+        latest.label = "↓"
+        older.disabled = self._history_loading or current <= 1
         turn_input.placeholder = f"Turn 1-{total}"
-        turn_input.disabled = self._history_loading or not toolbar_visible
-        newer.disabled = self._history_loading or end >= total
-        latest.disabled = self._history_loading or (end >= total and start == max(0, total - MAX_HISTORY_WINDOW_TURNS))
+        turn_input.disabled = self._history_loading
+        newer.disabled = self._history_loading or current >= total
+        transcript = self._mounted_transcript()
+        latest.disabled = self._history_loading or (
+            current >= total and (transcript is None or transcript.pinned_to_latest)
+        )
         if self._history_loading:
             info.update("History · loading…")
 
     @on(Transcript.ReachedTop)
     def _transcript_reached_top(self, event: Transcript.ReachedTop) -> None:
         event.stop()
-        if self._history_pager is None or self._history_loading:
+        if self._timeline is None or self._history_loading:
             return
-        if self._history_start_turn == 0:
+        if self._timeline.first_materialized_turn() <= 0:
+            self._update_history_toolbar()
             return
-        self.load_older_history()
+        self.prefetch_older_history()
 
     @on(Transcript.ReachedBottom)
     def _transcript_reached_bottom(self, event: Transcript.ReachedBottom) -> None:
         event.stop()
-        if self._history_pager is None or self._history_loading:
+        if self._timeline is None or self._history_loading:
             return
-        if self._history_end_turn >= self._history_total_turns:
+        last = self._timeline.last_materialized_turn()
+        if last + 1 >= self._history_total_turns:
+            self._update_history_toolbar()
             return
-        self.load_newer_history()
+        self.prefetch_newer_history()
+
+    @on(Transcript.ViewportTurn)
+    def _transcript_viewport_turn(self, event: Transcript.ViewportTurn) -> None:
+        event.stop()
+        self._update_history_toolbar()
 
     @on(Button.Pressed, "#load-older")
     def press_load_older(self) -> None:
@@ -455,6 +534,14 @@ class ChatScreen(Screen[None]):
     @on(Button.Pressed, "#jump-latest")
     def press_jump_latest(self) -> None:
         self.jump_to_latest()
+
+    @on(Button.Pressed, "#open-settings")
+    def press_settings(self) -> None:
+        self.action_settings()
+
+    @on(Button.Pressed, "#leave-session")
+    def press_leave_session(self) -> None:
+        self.action_leave_session()
 
     @on(Input.Submitted, "#history-turn")
     def submit_history_turn(self, event: Input.Submitted) -> None:
@@ -486,36 +573,54 @@ class ChatScreen(Screen[None]):
         if not turn_input.disabled:
             turn_input.focus()
 
+    async def _sync_timeline_rows(self) -> None:
+        timeline = self._timeline
+        if timeline is None:
+            return
+        items = timeline.display_items()
+        await self.transcript.replace_history_blocks(
+            [(kind, text, turn) for kind, text, turn in items]
+        )
+        self._history_total_turns = timeline.total_turns
+
+    async def _seek_timeline_turn(
+        self,
+        target: int,
+        *,
+        pin_latest: bool = False,
+        epoch: int | None = None,
+        session: object | None = None,
+    ) -> None:
+        """Slide the hydrated window to ``target`` and replace transcript history rows."""
+
+        timeline = self._timeline
+        if timeline is None:
+            return
+        await timeline.slide_to(target)
+        if epoch is not None and (epoch != self._chat_epoch or self._session is not session):
+            return
+        await self._sync_timeline_rows()
+        if pin_latest:
+            self.transcript.jump_to_latest()
+        else:
+            self.transcript.jump_to_turn(target)
+
     @work(exclusive=True, group="history")
     async def jump_to_history_turn(self, turn: int) -> None:
-        """Load a bounded window starting at a one-based turn number."""
+        """Seek the timeline to a one-based turn and scroll it to the top."""
 
-        pager = self._history_pager
+        timeline = self._timeline
         session = self._session
         epoch = self._chat_epoch
         total = self._history_total_turns
-        if pager is None or session is None or self._history_loading or not 1 <= turn <= total:
+        if timeline is None or session is None or self._history_loading or not 1 <= turn <= total:
             return
 
         self._history_loading = True
         self._update_history_toolbar()
         try:
-            start_turn = turn - 1
-            end_turn = min(total, start_turn + MAX_HISTORY_WINDOW_TURNS)
-            page = await pager.ending_at(
-                end_turn,
-                page_turns=end_turn - start_turn,
-            )
-            if epoch != self._chat_epoch or self._session is not session:
-                return
-            await self.transcript.replace_history_blocks(
-                [(block.kind, block.text) for block in page.blocks]
-            )
-            self._history_start_turn = page.start_turn
-            self._history_end_turn = page.end_turn
-            self._history_total_turns = page.total_turns
-            self.transcript.jump_to_history_start()
-        except Exception as exc:  # noqa: BLE001 - history paging must not kill chat
+            await self._seek_timeline_turn(turn - 1, epoch=epoch, session=session)
+        except Exception as exc:  # noqa: BLE001 - history seek must not kill chat
             if epoch == self._chat_epoch and self._session is session:
                 self.notify(f"Could not jump to turn {turn}: {exc}", severity="error")
         finally:
@@ -525,68 +630,27 @@ class ChatScreen(Screen[None]):
 
     @work(exclusive=True, group="history")
     async def load_older_history(self) -> None:
-        """Load one older page, or replace the bounded window at its edge."""
+        """Seek the previous TurnBegin, sliding the hydrated window."""
 
-        pager = self._history_pager
+        timeline = self._timeline
         session = self._session
         epoch = self._chat_epoch
-        if (
-            pager is None
-            or session is None
-            or self._history_loading
-            or self._history_start_turn <= 0
-        ):
+        if timeline is None or session is None or self._history_loading:
             return
+        current = max(0, self._display_turn() - 1)
+        first = timeline.first_materialized_turn()
+        if current <= 0:
+            if first <= 0:
+                return
+            target = first - 1
+        else:
+            target = current - 1
 
         self._history_loading = True
         self._update_history_toolbar()
-        current_start = self._history_start_turn
-        current_end = self._history_end_turn
-        loaded_turns = current_end - current_start
         try:
-            if loaded_turns >= MAX_HISTORY_WINDOW_TURNS:
-                page = await pager.before(
-                    current_start,
-                    page_turns=min(MAX_HISTORY_WINDOW_TURNS, current_start),
-                )
-                if epoch != self._chat_epoch or self._session is not session:
-                    return
-                await self.transcript.replace_history_blocks(
-                    [(block.kind, block.text) for block in page.blocks]
-                )
-                self._history_start_turn = page.start_turn
-                self._history_end_turn = page.end_turn
-                self._history_total_turns = page.total_turns
-                self.transcript.jump_to_history_end()
-                return
-
-            page_size = min(HISTORY_PAGE_TURNS, MAX_HISTORY_WINDOW_TURNS - loaded_turns)
-            page = await pager.before(current_start, page_turns=page_size)
-            if epoch != self._chat_epoch or self._session is not session:
-                return
-            added_lines = await self.transcript.prepend_history_blocks(
-                [(block.kind, block.text) for block in page.blocks]
-            )
-            if page.blocks and added_lines == 0:
-                # The transcript character budget is full. Replace the bounded
-                # window instead of allowing an unbounded prepend to grow it.
-                page = await pager.before(
-                    current_start,
-                    page_turns=MAX_HISTORY_WINDOW_TURNS,
-                )
-                if epoch != self._chat_epoch or self._session is not session:
-                    return
-                await self.transcript.replace_history_blocks(
-                    [(block.kind, block.text) for block in page.blocks]
-                )
-                self._history_start_turn = page.start_turn
-                self._history_end_turn = page.end_turn
-                self.transcript.jump_to_history_end()
-            else:
-                self._history_start_turn = page.start_turn
-                self._history_end_turn = current_end
-            self._history_total_turns = page.total_turns
-        except Exception as exc:  # noqa: BLE001 - history paging must not kill chat
+            await self._seek_timeline_turn(target, epoch=epoch, session=session)
+        except Exception as exc:  # noqa: BLE001 - history seek must not kill chat
             if epoch == self._chat_epoch and self._session is session:
                 self.notify(f"Could not load older history: {exc}", severity="error")
         finally:
@@ -596,40 +660,74 @@ class ChatScreen(Screen[None]):
 
     @work(exclusive=True, group="history")
     async def load_newer_history(self) -> None:
-        """Replace the bounded window with the next newer history page."""
+        """Seek the next TurnBegin, sliding the hydrated window."""
 
-        pager = self._history_pager
+        timeline = self._timeline
         session = self._session
         epoch = self._chat_epoch
-        if (
-            pager is None
-            or session is None
-            or self._history_loading
-            or self._history_end_turn >= self._history_total_turns
-        ):
+        total = self._history_total_turns
+        if timeline is None or session is None or self._history_loading:
             return
+        current = max(0, self._display_turn() - 1)
+        if current + 1 >= total:
+            return
+
         self._history_loading = True
         self._update_history_toolbar()
         try:
-            start_turn = self._history_end_turn
-            end_turn = min(
-                self._history_total_turns,
-                start_turn + MAX_HISTORY_WINDOW_TURNS,
-            )
-            page = await pager.ending_at(
-                end_turn,
-                page_turns=end_turn - start_turn,
-            )
-            if epoch != self._chat_epoch or self._session is not session:
-                return
-            await self.transcript.replace_history_blocks(
-                [(block.kind, block.text) for block in page.blocks]
-            )
-            self._history_start_turn = page.start_turn
-            self._history_end_turn = page.end_turn
-            self._history_total_turns = page.total_turns
-            self.transcript.jump_to_history_start()
-        except Exception as exc:  # noqa: BLE001 - history paging must not kill chat
+            await self._seek_timeline_turn(current + 1, epoch=epoch, session=session)
+        except Exception as exc:  # noqa: BLE001 - history seek must not kill chat
+            if epoch == self._chat_epoch and self._session is session:
+                self.notify(f"Could not load newer history: {exc}", severity="error")
+        finally:
+            if epoch == self._chat_epoch and self._session is session:
+                self._history_loading = False
+                self._update_history_toolbar()
+
+    @work(exclusive=True, group="history")
+    async def prefetch_older_history(self) -> None:
+        """Slide toward older unmaterialized turns when the window hits the top."""
+
+        timeline = self._timeline
+        session = self._session
+        epoch = self._chat_epoch
+        if timeline is None or session is None or self._history_loading:
+            return
+        first = timeline.first_materialized_turn()
+        if first <= 0:
+            return
+
+        self._history_loading = True
+        self._update_history_toolbar()
+        try:
+            await self._seek_timeline_turn(first - 1, epoch=epoch, session=session)
+        except Exception as exc:  # noqa: BLE001 - history seek must not kill chat
+            if epoch == self._chat_epoch and self._session is session:
+                self.notify(f"Could not load older history: {exc}", severity="error")
+        finally:
+            if epoch == self._chat_epoch and self._session is session:
+                self._history_loading = False
+                self._update_history_toolbar()
+
+    @work(exclusive=True, group="history")
+    async def prefetch_newer_history(self) -> None:
+        """Slide toward newer unmaterialized turns when the window hits the bottom."""
+
+        timeline = self._timeline
+        session = self._session
+        epoch = self._chat_epoch
+        total = self._history_total_turns
+        if timeline is None or session is None or self._history_loading:
+            return
+        last = timeline.last_materialized_turn()
+        if last + 1 >= total:
+            return
+
+        self._history_loading = True
+        self._update_history_toolbar()
+        try:
+            await self._seek_timeline_turn(last + 1, epoch=epoch, session=session)
+        except Exception as exc:  # noqa: BLE001 - history seek must not kill chat
             if epoch == self._chat_epoch and self._session is session:
                 self.notify(f"Could not load newer history: {exc}", severity="error")
         finally:
@@ -639,34 +737,28 @@ class ChatScreen(Screen[None]):
 
     @work(exclusive=True, group="history")
     async def jump_to_latest(self) -> None:
-        """Show the newest bounded history window and return to its tail."""
+        """Slide to the tail window and pin to the live stream immediately."""
 
-        pager = self._history_pager
+        timeline = self._timeline
         session = self._session
         epoch = self._chat_epoch
-        if pager is None or session is None or self._history_loading:
+        if timeline is None or session is None or self._history_loading:
+            self.transcript.jump_to_latest()
             return
+        total = self._history_total_turns
         if (
-            self._history_end_turn >= self._history_total_turns
-            and self._history_start_turn
-            == max(0, self._history_total_turns - MAX_HISTORY_WINDOW_TURNS)
+            total > 0
+            and self.transcript.pinned_to_latest
+            and (self.transcript.viewport_turn() is None or self.transcript.viewport_turn() >= total - 1)
         ):
             self.transcript.jump_to_latest()
+            self._update_history_toolbar()
             return
         self._history_loading = True
         self._update_history_toolbar()
         try:
-            page = await pager.latest(page_turns=MAX_HISTORY_WINDOW_TURNS)
-            if epoch != self._chat_epoch or self._session is not session:
-                return
-            await self.transcript.replace_history_blocks(
-                [(block.kind, block.text) for block in page.blocks]
-            )
-            self._history_start_turn = page.start_turn
-            self._history_end_turn = page.end_turn
-            self._history_total_turns = page.total_turns
-            self.transcript.jump_to_latest()
-        except Exception as exc:  # noqa: BLE001 - history paging must not kill chat
+            await self._seek_timeline_turn(max(0, total - 1), pin_latest=True, epoch=epoch, session=session)
+        except Exception as exc:  # noqa: BLE001 - history seek must not kill chat
             if epoch == self._chat_epoch and self._session is session:
                 self.notify(f"Could not jump to latest history: {exc}", severity="error")
         finally:
@@ -675,29 +767,56 @@ class ChatScreen(Screen[None]):
                 self._update_history_toolbar()
 
     def _set_status(self, text: str) -> None:
+        if not self.is_attached:
+            return
         if self._pending_config_label:
             text += f" · next: {self._pending_config_label}"
-        self.query_one("#status", Static).update(text)
+        with suppress(NoMatches):
+            self.query_one("#status", Static).update(text)
+
+    def _set_context(self, text: str) -> None:
+        if not self.is_attached:
+            return
+        with suppress(NoMatches):
+            self.query_one("#context", Static).update(text)
 
     def set_pending_config(self, label: str) -> None:
         self._pending_config_label = label
         session = self._session
         if session is not None:
             detail = self._last_wire_status or format_status(session.status)
-            self._set_status(f"session {session.id} · {detail}")
+            self._set_status(f"session {session.id}")
+            self._set_context(detail)
 
     def _set_input_enabled(self, enabled: bool) -> None:
-        prompt = self.query_one("#prompt", Input)
-        prompt.disabled = not enabled
-        if enabled:
-            prompt.focus()
+        if not self.is_attached:
+            return
+        with suppress(NoMatches):
+            prompt = self.query_one("#prompt", PromptInput)
+            prompt.disabled = not enabled
+            if enabled:
+                prompt.focus()
 
-    @on(Input.Submitted, "#prompt")
-    async def submit_prompt(self, event: Input.Submitted) -> None:
+    def _restore_idle_ui(self, session: SdkSession) -> None:
+        if self._session is not session:
+            return
+        self._set_input_enabled(True)
+        detail = self._last_wire_status or format_status(session.status)
+        self._set_status(f"session {session.id}")
+        self._set_context(detail)
+
+    async def _append_transcript(self, kind: str, text: str) -> None:
+        transcript = self._mounted_transcript()
+        if transcript is None:
+            return
+        await transcript.append_block(kind, text)
+
+    @on(PromptInput.Submitted, "#prompt")
+    async def submit_prompt(self, event: PromptInput.Submitted) -> None:
         text = event.value.strip()
         if not text or self._session is None or self._busy:
             return
-        event.input.value = ""
+        event.prompt.clear()
         if text.startswith("/"):
             self.run_command(text)
         else:
@@ -727,25 +846,26 @@ class ChatScreen(Screen[None]):
                 await self._render_message(message)
         except RunCancelled:
             if self._session is session:
-                await self.transcript.append_block("system", "Generation cancelled")
+                await self._append_transcript("system", "Generation cancelled")
         except Exception as exc:  # noqa: BLE001 - surface SDK failures in the transcript
             if self._session is session:
-                await self.transcript.append_block("error", f"{type(exc).__name__}: {exc}")
+                await self._append_transcript("error", f"{type(exc).__name__}: {exc}")
         finally:
-            self.transcript.finish_stream()
             self._busy = False
-            if self._session is session:
-                self._set_input_enabled(True)
-                detail = self._last_wire_status or format_status(session.status)
-                self._set_status(f"session {session.id} · {detail}")
+            transcript = self._mounted_transcript()
+            if transcript is not None:
+                transcript.finish_stream()
+            self._restore_idle_ui(session)
 
     async def _handle_approval(self, request: ApprovalRequest) -> None:
-        self.transcript.finish_stream()
+        transcript = self._mounted_transcript()
+        if transcript is not None:
+            transcript.finish_stream()
         decision = await self.app.push_screen_wait(
             ApprovalScreen(f"Approve {request.action}?", request.description)
         )
         request.resolve(decision)  # type: ignore[arg-type]
-        await self.transcript.append_block(
+        await self._append_transcript(
             "system",
             f"Approval decision: {decision}\nRequest ID: {request.id}",
         )
@@ -758,21 +878,22 @@ class ChatScreen(Screen[None]):
 
     async def _append_rendered(self, rendered: RenderEvent) -> None:
         if rendered.kind == "status":
-            session = self._session
-            prefix = f"session {session.id} · " if session is not None else ""
             self._last_wire_status = rendered.text
-            self._set_status(prefix + rendered.text)
+            self._set_context(rendered.text)
+            return
+        transcript = self._mounted_transcript()
+        if transcript is None:
             return
         if rendered.starts_stream:
-            self.transcript.finish_stream()
+            transcript.finish_stream()
         if rendered.streaming:
-            await self.transcript.append_stream(
+            await transcript.append_stream(
                 rendered.kind,
                 rendered.text,
                 replace=rendered.replaces_stream,
             )
         else:
-            await self.transcript.append_block(rendered.kind, rendered.text)
+            await transcript.append_block(rendered.kind, rendered.text)
 
     async def _handle_other_request(self, request: object) -> None:
         """Handle request variants without importing private SDK modules."""
@@ -871,13 +992,10 @@ class ChatScreen(Screen[None]):
             else:
                 await self.transcript.append_block("error", f"Unknown command: {name}")
         except Exception as exc:  # noqa: BLE001 - commands report errors without exiting
-            await self.transcript.append_block("error", f"{type(exc).__name__}: {exc}")
+            await self._append_transcript("error", f"{type(exc).__name__}: {exc}")
         finally:
             self._busy = False
-            if self._session is session:
-                self._set_input_enabled(True)
-                detail = self._last_wire_status or format_status(session.status)
-                self._set_status(f"session {session.id} · {detail}")
+            self._restore_idle_ui(session)
 
     def action_cancel_prompt(self) -> None:
         if self._session is not None and self._busy:
@@ -888,7 +1006,7 @@ class ChatScreen(Screen[None]):
 
     def action_focus_prompt(self) -> None:
         if not self._busy:
-            self.query_one("#prompt", Input).focus()
+            self.query_one("#prompt", PromptInput).focus()
 
     def action_settings(self) -> None:
         session_id = self._session.id if self._session is not None else self._options.session_id

@@ -35,6 +35,8 @@ from kimi_agent_sdk import (
     VideoURLPart,
 )
 
+from kimix_tui.tool_display import format_tool_call_text, format_tool_result_text
+
 RenderKind = Literal[
     "assistant",
     "thinking",
@@ -71,33 +73,7 @@ class RenderState:
     status_values: dict[str, object] = field(default_factory=dict)
 
 
-DISPLAY_CHAR_LIMIT = 4_000
 _OBSERVABILITY_EVENTS = {"LLMRequest", "LLMToolsSnapshot", "MCPToolsDiscovered"}
-
-
-def truncate_display(text: str, limit: int = DISPLAY_CHAR_LIMIT) -> str:
-    """Keep at most ``limit`` characters without retaining the dropped tail."""
-
-    if len(text) <= limit:
-        return text
-    omitted = len(text) - limit
-    return f"{text[:limit]}\n… output truncated ({omitted} more chars)"
-
-
-def bounded_concat(existing: str, fragment: str, limit: int = DISPLAY_CHAR_LIMIT) -> str:
-    """Append ``fragment`` without ever allocating ``existing + fragment`` past ``limit``."""
-
-    if not fragment:
-        return existing
-    if not existing:
-        return truncate_display(fragment, limit)
-    if len(existing) >= limit:
-        return existing
-    room = limit - len(existing)
-    if len(fragment) <= room:
-        return existing + fragment
-    omitted = len(fragment) - room
-    return f"{existing}{fragment[:room]}\n… output truncated ({omitted} more chars)"
 
 
 def _model_data(value: object) -> object:
@@ -215,34 +191,23 @@ def format_display_blocks(display: Sequence[object]) -> str:
 
 def _tool_call_text(
     name: str,
-    call_id: str,
+    _call_id: str,
     arguments: str | None,
     extras: object = None,
 ) -> str:
-    lines = [name, f"Call ID: {call_id}"]
-    if extras:
-        lines.append(f"Extras:\n{_json_text(extras)}")
-    lines.append(f"Arguments:\n{_pretty_json(arguments)}")
-    return "\n".join(lines)
+    return format_tool_call_text(name, arguments, extras)
 
 
 def _tool_result_text(message: ToolResult, tool_name: str | None) -> str:
     result = message.return_value
-    outcome = "failed" if result.is_error else "succeeded"
-    lines = [f"{tool_name or 'Tool'} · {outcome}", f"Call ID: {message.tool_call_id}"]
-    if result.message:
-        lines.append(f"Message:\n{result.message}")
-    display = format_display_blocks(result.display)
-    if display:
-        lines.append(f"Display:\n{display}")
-    output = _content_text(result.output)
-    if output:
-        lines.append(f"Output:\n{output}")
-    if result.extras:
-        lines.append(f"Extras:\n{_json_text(result.extras)}")
-    if len(lines) == 2:
-        lines.append("(no visible output)")
-    return truncate_display("\n\n".join(lines))
+    return format_tool_result_text(
+        tool_name,
+        is_error=result.is_error,
+        message=result.message or "",
+        display=format_display_blocks(result.display),
+        output=_content_text(result.output),
+        extras=result.extras,
+    )
 
 
 def _approval_text(message: ApprovalRequest) -> str:
@@ -455,7 +420,7 @@ def render_wire_message(
         return RenderEvent("system", _media_text("Video", message.video_url))
     if isinstance(message, ToolCall):
         state.tool_names[message.id] = message.function.name
-        state.tool_arguments[message.id] = truncate_display(message.function.arguments or "")
+        state.tool_arguments[message.id] = message.function.arguments or ""
         if message.extras:
             state.tool_extras[message.id] = message.extras
         state.active_tool_call_id = message.id
@@ -483,7 +448,7 @@ def render_wire_message(
                 streaming=True,
                 starts_stream=True,
             )
-        arguments = bounded_concat(state.tool_arguments.get(call_id, ""), fragment)
+        arguments = state.tool_arguments.get(call_id, "") + fragment
         state.tool_arguments[call_id] = arguments
         return RenderEvent(
             "tool",
@@ -573,7 +538,7 @@ def render_wire_message(
 
 
 def format_status(status: object) -> str:
-    """Format context, token, message, and MCP status information."""
+    """Format context, token, and MCP status information."""
 
     tokens = getattr(status, "context_tokens", None)
     maximum = getattr(status, "max_context_tokens", None)
@@ -600,10 +565,6 @@ def format_status(status: object) -> str:
             f"(new {input_other:,}, cache read {cache_read:,}, cache write {cache_creation:,})"
         )
         fields.append(f"out {getattr(token_usage, 'output', 0):,}")
-
-    message_id = getattr(status, "message_id", None)
-    if message_id:
-        fields.append(f"message {message_id}")
 
     mcp = getattr(status, "mcp_status", None)
     if mcp is not None:
