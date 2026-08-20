@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import orjson
 from kimi_agent_sdk import (
     BriefDisplayBlock,
     CompactionEnd,
@@ -88,13 +89,71 @@ def test_tool_stream_and_result_keep_all_public_details() -> None:
     assert part.replaces_stream is True
     assert part.text.startswith("read  a.py")
     assert "Call ID" not in part.text
+    assert '"provider": "test"' in part.text
     assert result is not None and result.kind == "tool_result"
     assert "a.py" in result.text
     assert "long internal output" in result.text
+    assert '"provider": "test"' in call.text
+    assert '"bytes": 20' in result.text
     assert "Call ID" not in result.text
     assert "Message:" not in result.text
     assert "Display:" not in result.text
     assert "Output:" not in result.text
+
+
+def test_write_and_python_calls_keep_original_payloads() -> None:
+    source = "print(1)\nprint(2)\n" + ("x" * 80)
+    write = render_wire_message(
+        ToolCall(
+            id="w1",
+            function=ToolCall.FunctionBody(
+                name="write",
+                arguments=orjson.dumps({"path": "a.py", "content": source}).decode("utf-8"),
+            ),
+        )
+    )
+    python = render_wire_message(
+        ToolCall(
+            id="p1",
+            function=ToolCall.FunctionBody(
+                name="python",
+                arguments=orjson.dumps({"code": source}).decode("utf-8"),
+            ),
+        )
+    )
+
+    assert write is not None
+    assert write.text.startswith("write  a.py")
+    assert "content:" in write.text
+    assert source in write.text
+    assert python is not None
+    assert python.text.startswith("python  print(1)")
+    assert "code:" in python.text
+    assert source in python.text
+
+
+def test_edit_call_keeps_full_old_and_new_text() -> None:
+    old = "alpha\n" * 20
+    new = "beta\n" * 20
+    event = render_wire_message(
+        ToolCall(
+            id="e1",
+            function=ToolCall.FunctionBody(
+                name="edit",
+                arguments=orjson.dumps(
+                    {"path": "f.py", "edit": [{"old": old, "new": new}]}
+                ).decode("utf-8"),
+            ),
+        )
+    )
+
+    assert event is not None
+    assert event.text.startswith("edit  f.py")
+    assert "old:" in event.text
+    assert "new:" in event.text
+    assert old in event.text
+    assert new in event.text
+    assert "1 edit" in event.text.splitlines()[0]
 
 
 def test_grep_and_todo_calls_are_human_readable() -> None:

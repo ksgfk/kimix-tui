@@ -105,30 +105,44 @@ def copy_hit_start(width: int) -> int:
 
 
 def _compact_summary(text: str, width: int, *, lead_name: str | None = None) -> str:
-    """Build a useful one-line summary while preserving wide characters."""
+    """Build a useful one-line summary from the compact headline."""
 
-    lines = [" ".join(line.split()) for line in text.splitlines() if line.strip()]
-    if not lines:
-        summary = "(no details)"
-    else:
-        details = [
-            line
-            for line in lines[1:]
-            if line not in _SUMMARY_SECTION_LABELS
-            and not line.startswith(_SUMMARY_METADATA_PREFIXES)
-        ]
-        summary = strip_tool_name(lines[0], lead_name) if lead_name else lines[0]
-        if not summary and details:
-            summary = details.pop(0)
-        if details:
-            summary += " · " + " ".join(details)
-        if not summary:
-            summary = lines[0]
+    summary = "(no details)"
+    for raw in text.splitlines():
+        line = " ".join(raw.split())
+        if not line:
+            continue
+        candidate = strip_tool_name(line, lead_name) if lead_name else line
+        if not candidate:
+            continue
+        if candidate in _SUMMARY_SECTION_LABELS or candidate.startswith(
+            _SUMMARY_METADATA_PREFIXES
+        ):
+            continue
+        if candidate.endswith(":") and cell_len(candidate) < 24:
+            continue
+        summary = candidate
+        break
     if cell_len(summary) <= width:
         return summary
     if width <= 3:
         return "." * width
     return f"{set_cell_size(summary, width - 3)}..."
+
+
+def _expanded_body(kind: str, text: str, tool_name: str | None) -> str:
+    """Return the original payload for an expanded auxiliary record."""
+
+    body_text = text or "(no details)"
+    if not tool_name:
+        return body_text
+    body_lines = body_text.splitlines() or [body_text]
+    body_lines[0] = strip_tool_name(body_lines[0], tool_name)
+    if kind in {"tool", "tool_result", "error"} and len(body_lines) > 1:
+        details = "\n".join(body_lines[1:]).strip()
+        if details:
+            return details
+    return "\n".join(body_lines).strip() or "(no details)"
 
 
 def _without_background(style: Style) -> Style:
@@ -289,11 +303,7 @@ def render_record_strips(
                 mark_style=mark_style,
             )
         )
-        body_text = text or "(no details)"
-        if tool_name:
-            body_lines = body_text.splitlines() or [body_text]
-            body_lines[0] = strip_tool_name(body_lines[0], tool_name)
-            body_text = "\n".join(body_lines).strip() or "(no details)"
+        body_text = _expanded_body(kind, text, tool_name)
         body = _styled_text(body_text, body_style)
         for wrapped in body.wrap(console, body_width, overflow="fold"):
             strips.append(_strip_from_text(wrapped, console))

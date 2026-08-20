@@ -8,6 +8,56 @@ from typing import Any
 import orjson
 
 _BORING_MESSAGES = frozenset({"success", "succeeded", "ok", "done", "completed"})
+_COMPACT_VALUE_MAX_LEN = 60
+
+# Match kimix CLI stream printing: long decoded payloads use ``key:\\nvalue``.
+_STREAM_ARG_KEYS = frozenset({
+    "content",
+    "code",
+    "prompt",
+    "old",
+    "new",
+    "question",
+    "context",
+    "instruction",
+    "command",
+})
+
+# Parity with ``kimix.ui.stream._ARG_KEY_ALIASES`` so collapsed/expanded
+# labels match the CLI (``file_path`` → ``path``, ``old_string`` → ``old``).
+_ARG_KEY_ALIASES: dict[str, str] = {
+    "old_string": "old",
+    "new_string": "new",
+    "text": "content",
+    "source_code": "code",
+    "task": "prompt",
+    "file_path": "path",
+    "cmd": "command",
+    "session": "session_id",
+    "edits": "edit",
+    "items": "todos",
+    "block": "wait",
+    "token_kill": "deduplicate_output",
+    "old_str": "old",
+    "new_str": "new",
+    "old_content": "old",
+    "new_content": "new",
+    "original": "old",
+    "replace_with": "new",
+    "data": "content",
+    "body": "content",
+    "file": "path",
+    "filepath": "path",
+    "filename": "path",
+    "file_name": "path",
+    "changes": "edit",
+    "modifications": "edit",
+    "-A": "after_context",
+    "-B": "before_context",
+    "-C": "context",
+    "-n": "line_number",
+    "-i": "ignore_case",
+}
 
 _FAMILY_ALIASES: dict[str, str] = {
     "read": "read",
@@ -171,17 +221,22 @@ def format_tool_call_text(
     arguments: str | None,
     extras: object = None,
 ) -> str:
-    """Human-readable tool-call body. First line always starts with ``name``."""
+    """Human-readable tool-call body. First line always starts with ``name``.
+
+    Line 1 is a compact headline used by the collapsed transcript row.
+    Following lines keep the original arguments, in the same decoded
+    ``key:`` / value layout as the Kimix CLI tool-call printer.
+    """
 
     parsed = _parse_object(arguments)
     family = tool_family(name)
     headline, extra_lines = _call_details(family, parsed, arguments)
+    original = extra_lines if extra_lines else _format_original_args(parsed, arguments)
+    if original == [headline]:
+        original = []
     lines = [f"{name}  {headline}" if headline else name]
-    lines.extend(extra_lines)
-    if family == "generic" and extras:
-        dumped = _pretty_value(extras)
-        if dumped:
-            lines.append(dumped)
+    lines.extend(original)
+    _append_extras(lines, extras)
     return "\n".join(lines)
 
 
@@ -197,7 +252,6 @@ def format_tool_result_text(
     """Human-readable tool-result body. First line starts with the tool name."""
 
     name = tool_name or "Tool"
-    family = tool_family(tool_name)
     outcome = "failed" if is_error else "succeeded"
     headline = _result_headline(name, message, display, outcome)
     lines = [f"{name}  {headline}" if headline else name]
@@ -209,15 +263,13 @@ def format_tool_result_text(
             continue
         lines.append(part)
 
-    if message and message.strip().lower() not in _BORING_MESSAGES:
-        first = message.splitlines()[0].strip()
-        if first and first != headline and message not in lines:
+    if message and message not in lines:
+        stripped = message.strip()
+        boring = stripped.lower() in _BORING_MESSAGES
+        if not boring and not _is_redundant_part(message, name, headline):
             lines.append(message)
 
-    if family == "generic" and extras:
-        dumped = _pretty_value(extras)
-        if dumped:
-            lines.append(dumped)
+    _append_extras(lines, extras)
 
     if len(lines) == 1 and not headline:
         lines.append("(no visible output)")
@@ -252,6 +304,14 @@ def _pretty_value(value: object) -> str:
         return str(value)
 
 
+def _append_extras(lines: list[str], extras: object) -> None:
+    if extras in (None, "", {}, []):
+        return
+    dumped = _pretty_value(extras)
+    if dumped and dumped not in lines:
+        lines.append(dumped)
+
+
 def _one_line(value: object, limit: int = 72) -> str:
     text = " ".join(str(value).split())
     if len(text) <= limit:
@@ -276,6 +336,84 @@ def _first(parsed: Mapping[str, Any], *keys: str) -> object:
         if key in parsed and parsed[key] not in (None, ""):
             return parsed[key]
     return None
+
+
+def _canonical_key(key: str) -> str:
+    canonical = _ARG_KEY_ALIASES.get(key)
+    if canonical is not None:
+        return canonical
+    return _ARG_KEY_ALIASES.get(key.lower(), key)
+
+
+def _join_headline(lead: str, bits: Sequence[str]) -> str:
+    extra = [bit for bit in bits if bit]
+    if lead and extra:
+        return f"{lead} · {' · '.join(extra)}"
+    return lead or " · ".join(extra)
+
+
+def _compact_generic_headline(parsed: Mapping[str, Any]) -> str:
+    parts: list[str] = []
+    stream_preview = ""
+    for key, value in parsed.items():
+        canonical = _canonical_key(str(key))
+        if canonical in _STREAM_ARG_KEYS and isinstance(value, str):
+            if not stream_preview and value.strip():
+                first_line = next(
+                    (line.strip() for line in value.splitlines() if line.strip()),
+                    value,
+                )
+                stream_preview = _one_line(first_line, 72)
+            continue
+        text = " ".join(str(value).split())
+        if len(text) > _COMPACT_VALUE_MAX_LEN:
+            text = text[: _COMPACT_VALUE_MAX_LEN - 3] + "..."
+        parts.append(f"{canonical}:{text}")
+    return " ".join(parts) or stream_preview
+
+
+def _format_original_args(parsed: dict[str, Any] | None, raw: str | None) -> list[str]:
+    """Decode tool arguments the way Kimix CLI prints them after the header."""
+
+    if parsed is None:
+        leftover = (raw or "").strip()
+        return [leftover] if leftover else []
+    lines: list[str] = []
+    _append_original_mapping(parsed, lines)
+    return lines
+
+
+def _append_original_mapping(parsed: Mapping[str, Any], lines: list[str]) -> None:
+    for key, value in parsed.items():
+        lines.extend(_original_field(_canonical_key(str(key)), value))
+
+
+def _original_field(key: str, value: object) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        if key in _STREAM_ARG_KEYS or "\n" in value:
+            return [f"{key}:", value]
+        return [f"{key}: {value}"]
+    if isinstance(value, Mapping):
+        inner: list[str] = []
+        _append_original_mapping(value, inner)
+        if not inner:
+            return []
+        return [f"{key}:", *inner]
+    if isinstance(value, Sequence) and not isinstance(value, str | bytes):
+        if not value:
+            return []
+        if all(isinstance(item, Mapping) for item in value):
+            nested: list[str] = []
+            for item in value:
+                _append_original_mapping(item, nested)
+            return nested
+        dumped = _pretty_value(list(value))
+        if "\n" in dumped:
+            return [f"{key}:", dumped]
+        return [f"{key}: {dumped}"]
+    return [f"{key}: {value}"]
 
 
 def _todo_marker(status: object) -> str:
@@ -323,7 +461,7 @@ def _call_details(
             bits.append(f"{limit} lines")
         if parsed.get("glob"):
             bits.append("glob")
-        return path, ([" · ".join(bits)] if bits else [])
+        return _join_headline(path, bits), []
 
     if family == "grep":
         pattern = str(_first(parsed, "pattern") or "")
@@ -339,13 +477,13 @@ def _call_details(
             bits.append(str(mode))
         if parsed.get("-i") or parsed.get("case_insensitive"):
             bits.append("ignore-case")
-        return pattern, ([" · ".join(bits)] if bits else [])
+        return _join_headline(pattern, bits), []
 
     if family == "glob":
         pattern = str(_first(parsed, "pattern") or "")
         path = parsed.get("path")
         extra = [str(path)] if path not in (None, "", ".") else []
-        return pattern, extra
+        return _join_headline(pattern, extra), []
 
     if family == "write":
         path = _short_path(_first(parsed, "file_path", "path"))
@@ -353,12 +491,12 @@ def _call_details(
         mode = parsed.get("mode")
         if mode not in (None, "", "overwrite"):
             extra.append(str(mode))
-        return path, extra
+        return _join_headline(path, extra), []
 
     if family == "edit":
         path = _short_path(_first(parsed, "file_path", "path"))
         extra = []
-        edits = parsed.get("edits")
+        edits = parsed.get("edits") or parsed.get("edit")
         old = _first(parsed, "old", "old_string")
         new = _first(parsed, "new", "new_string")
         if isinstance(edits, Sequence) and not isinstance(edits, str | bytes) and edits:
@@ -367,10 +505,10 @@ def _call_details(
             if isinstance(first, Mapping):
                 old = first.get("old") or first.get("old_string") or old
         if old:
-            extra.append(_one_line(old, 60))
-        if new and not old:
-            extra.append(_one_line(new, 60))
-        return path, extra
+            extra.append(_one_line(old, 40))
+        elif new:
+            extra.append(_one_line(new, 40))
+        return _join_headline(path, extra), []
 
     if family == "shell":
         command = str(_first(parsed, "command", "cmd") or "")
@@ -378,7 +516,7 @@ def _call_details(
         cwd = _first(parsed, "working_directory", "cwd", "workdir")
         if cwd:
             extra.append(str(cwd))
-        return command, extra
+        return _join_headline(command, extra), []
 
     if family == "python":
         code = str(_first(parsed, "code", "file") or "")
@@ -422,7 +560,7 @@ def _call_details(
         return _one_line(_first(parsed, "description", "prompt") or "", 72), []
 
     dumped = _pretty_value(parsed)
-    return "", [dumped] if dumped else []
+    return _compact_generic_headline(parsed), [dumped] if dumped else []
 
 
 def _result_headline(name: str, message: str, display: str, outcome: str) -> str:

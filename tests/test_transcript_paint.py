@@ -97,22 +97,23 @@ def test_non_dialogue_records_are_compacted_to_one_line() -> None:
     assert "▸ Read" in _plain(strips)
     assert "file succeeded" in _plain(strips)
     assert "Call ID" not in _plain(strips)
-    assert "Output" in _plain(strips)
+    assert "very detailed result" not in _plain(strips)
 
 
-def test_tool_summary_prioritizes_arguments_over_call_metadata() -> None:
+def test_tool_summary_uses_compact_headline_not_payload() -> None:
     strips = render_record_strips(
         "tool",
-        'read_file\nCall ID: call-123\nArguments:\n{\n  "path": "demo.py"\n}',
+        "write  demo.py\npath: demo.py\ncontent:\nprint('hello')\nprint('world')",
         width=48,
         console=_console(),
     )
 
     plain = _plain(strips)
     assert len(strips) == 1
-    assert "▸ Read" in plain
+    assert "▸ Write" in plain
     assert "demo.py" in plain
-    assert "Call ID" not in plain
+    assert "print('hello')" not in plain
+    assert "print('world')" not in plain
 
 
 def test_expanded_non_dialogue_records_show_the_full_message() -> None:
@@ -131,6 +132,25 @@ def test_expanded_non_dialogue_records_show_the_full_message() -> None:
     assert "Read file succeeded" not in header
     assert "Call ID: call-123" in plain
     assert "Output: all details" in plain
+
+
+def test_expanded_tool_call_shows_original_cli_style_payload() -> None:
+    content = "line one\nline two\nline three"
+    strips = render_record_strips(
+        "tool",
+        f"write  demo.py\npath: demo.py\ncontent:\n{content}",
+        width=48,
+        console=_console(),
+        expanded=True,
+    )
+
+    plain = _plain(strips)
+    header = "".join(segment.text for segment in strips[0]._segments)
+    assert "▾ Write" in header
+    assert "content:" in plain
+    assert "line one" in plain
+    assert "line two" in plain
+    assert "line three" in plain
 
 
 def test_non_dialogue_body_is_gray_not_vivid() -> None:
