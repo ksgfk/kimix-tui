@@ -10,6 +10,7 @@ from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QDialog,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -127,12 +128,17 @@ class LLMSettingsDialog(QDialog):
             self._path_input = QLineEdit(str(self._current.path))
             self._path_input.setObjectName("config-path")
             self._path_input.setPlaceholderText(r"C:\path\to\provider.json")
+            browse = QPushButton("Browse...")
+            browse.setObjectName("browse-config")
+            browse.setToolTip("Choose a JSON file")
             load = QPushButton("Add config")
             load.setObjectName("load-config")
-            path_row.addWidget(self._path_input)
+            path_row.addWidget(self._path_input, 1)
+            path_row.addWidget(browse)
             path_row.addWidget(load)
             root.addLayout(path_row)
             self._path_input.returnPressed.connect(lambda: self._add_path(Path(self._path_input.text())))
+            browse.clicked.connect(self._browse_path)
             load.clicked.connect(lambda: self._add_path(Path(self._path_input.text())))
         else:
             self._path_input = None
@@ -267,6 +273,30 @@ class LLMSettingsDialog(QDialog):
         if self._path_input is not None:
             self._path_input.setText(str(path))
 
+    def _browse_start_directory(self) -> str:
+        candidates: list[Path] = []
+        if self._path_input is not None:
+            typed = self._path_input.text().strip()
+            if typed:
+                candidates.append(Path(typed))
+        candidates.append(self._current.path)
+        for candidate in candidates:
+            expanded = candidate.expanduser()
+            if expanded.is_file():
+                return str(expanded.parent)
+            if expanded.is_dir():
+                return str(expanded)
+            parent = expanded.parent
+            if parent.is_dir():
+                return str(parent)
+        return str(Path.home())
+
+    def _browse_path(self) -> None:
+        selected = pick_json_file(self, self._browse_start_directory())
+        if selected is None:
+            return
+        self._add_path(selected)
+
     def _add_path(self, path: Path) -> None:
         try:
             reference = self._inspector(path)
@@ -387,6 +417,18 @@ class LLMSettingsDialog(QDialog):
             for row in range(self._list.count())
             if isinstance((item := self._list.item(row)), ConfigListItem)
         ]
+
+
+def pick_json_file(parent: QWidget | None, start_directory: str) -> Path | None:
+    selected, _selected_filter = QFileDialog.getOpenFileName(
+        parent,
+        "Select Kimix provider config",
+        start_directory,
+        "JSON files (*.json)",
+    )
+    if not selected:
+        return None
+    return Path(selected)
 
 
 def _format_tokens(value: int | None) -> str:

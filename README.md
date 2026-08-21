@@ -60,7 +60,7 @@ uv run kimix-tui --config=C:\path\to\provider.json
 
 主页顶部 **Settings** 修改 work dir 的新会话默认配置；可在 **Kimix provider config (.json)** 输入与 `kimix --config=...` 相同的外部 JSON 路径。**Add config** 校验并加入全局配置库，不改变当前绑定；从配置库选择后，**Use config** 才会应用到当前作用域。历史会话详情中的 **Configure** 修改该 session 下次恢复时使用的配置。聊天页按 `F4` 修改当前 session 的下次恢复配置，不会替换正在运行的 LLM。
 
-配置优先级为 session 配置高于 work dir 默认配置。工程 Settings 可以添加或移除配置库引用，但不能移除正在使用的工程默认；移除引用不会删除 provider JSON 文件。配置单个 session 时只能从现有配置中选择，也可以选择 **Project default**；session Settings 不提供添加或删除操作。选择工程默认会删除该 session 的独立配置引用，使它持续跟随工程默认。全局 `KIMI_SHARE_DIR/kimix-tui.json`（默认 `~/.kimi/kimix-tui.json`）只保存配置文件绝对路径列表和各 work dir 的默认路径；每个 session 的配置路径保存在 Kimi session 目录自己的 `kimix-tui.json`。这些引用文件不保存模型摘要、Provider 参数或 API Key。若引用的 provider JSON 丢失，界面显示其路径和 Missing，禁止进入并要求先重新配置。
+配置优先级为 session 配置高于 work dir 默认配置。工程 Settings 可以添加或移除配置库引用，但不能移除正在使用的工程默认；移除引用不会删除 provider JSON 文件。配置单个 session 时只能从现有配置中选择，也可以选择 **Project default**；session Settings 不提供添加或删除操作。选择工程默认会删除该 session 的独立配置引用，使它持续跟随工程默认。全局 `KIMI_SHARE_DIR/kimix-gui.json`（默认 `~/.kimi/kimix-gui.json`）只保存配置文件绝对路径列表和各 work dir 的默认路径；每个 session 的配置路径保存在 Kimi session 目录自己的 `kimix-gui.json`。这些引用文件不保存模型摘要、Provider 参数或 API Key。若引用的 provider JSON 丢失，界面显示其路径和 Missing，禁止进入并要求先重新配置。
 
 建议以桌面窗口运行。主页支持鼠标预览和打开会话。
 

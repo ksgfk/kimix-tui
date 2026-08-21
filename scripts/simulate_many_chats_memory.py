@@ -136,8 +136,8 @@ def _make_config_store(tmp_path: Path) -> LLMConfigStore:
         encoding="utf-8",
     )
     store = LLMConfigStore(
-        tmp_path / "kimix-tui.json",
-        session_file_resolver=lambda _wd, sid: (tmp_path / "sessions" / sid / "kimix-tui.json"),
+        tmp_path / "kimix-gui.json",
+        session_file_resolver=lambda _wd, sid: (tmp_path / "sessions" / sid / "kimix-gui.json"),
     )
     store.set_default(tmp_path, inspect_llm_config(config_file))
     return store

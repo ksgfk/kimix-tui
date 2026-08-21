@@ -8,6 +8,7 @@ import pytest
 from kimix_tui.llm_config import (
     LLMConfigStore,
     config_file_available,
+    default_store_file,
     inspect_llm_config,
     session_config_file,
     unavailable_config_reference,
@@ -18,7 +19,7 @@ def config_store(tmp_path: Path, metadata_file: Path | None = None) -> LLMConfig
     return LLMConfigStore(
         metadata_file or (tmp_path / "metadata.json"),
         session_file_resolver=lambda _work_dir, session_id: (
-            tmp_path / "sessions" / session_id / "kimix-tui.json"
+            tmp_path / "sessions" / session_id / "kimix-gui.json"
         ),
     )
 
@@ -109,7 +110,7 @@ def test_store_persists_project_and_session_references_without_secrets(tmp_path:
         display_name="Test Model",
     )
     reference = inspect_llm_config(config_file)
-    metadata_file = tmp_path / "kimix-tui.json"
+    metadata_file = tmp_path / "kimix-gui.json"
     work_dir = tmp_path / "project"
     store = config_store(tmp_path, metadata_file)
 
@@ -134,7 +135,7 @@ def test_store_persists_project_and_session_references_without_secrets(tmp_path:
         "work_dirs": {str(work_dir.resolve()): {"default": str(config_file.resolve())}},
     }
     session_data = json.loads(
-        (tmp_path / "sessions" / "session-1" / "kimix-tui.json").read_text(encoding="utf-8")
+        (tmp_path / "sessions" / "session-1" / "kimix-gui.json").read_text(encoding="utf-8")
     )
     assert session_data == {"version": 1, "config": str(config_file.resolve())}
 
@@ -153,9 +154,18 @@ def test_session_config_file_lives_inside_kimi_session_directory(
 
     path = session_config_file(tmp_path / "project", "session-1")
 
-    assert path.name == "kimix-tui.json"
+    assert path.name == "kimix-gui.json"
     assert path.parent.name == "session-1"
     assert path.parents[2].name == "sessions"
+
+
+def test_default_store_file_uses_kimix_gui_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KIMI_SHARE_DIR", str(tmp_path / "share"))
+
+    assert default_store_file() == tmp_path / "share" / "kimix-gui.json"
 
 
 def test_config_library_is_shared_across_work_dirs(tmp_path: Path) -> None:

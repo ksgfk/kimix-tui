@@ -209,14 +209,22 @@ def config_file_available(reference: LLMConfigReference) -> bool:
 
 SessionConfigFileResolver = Callable[[Path, str], Path]
 
+STORE_FILENAME = "kimix-gui.json"
+
+
+def default_store_file() -> Path:
+    """Return the share-dir file that stores config library paths."""
+
+    return get_share_dir() / STORE_FILENAME
+
 
 def session_config_file(work_dir: Path, session_id: str) -> Path:
-    """Return the TUI-owned config reference file inside a Kimi session."""
+    """Return the config reference file inside a Kimi session."""
 
     if not session_id or Path(session_id).name != session_id:
         raise ValueError(f"Invalid session id: {session_id!r}")
     resolved = resolve_kimi_work_dir(work_dir)
-    return WorkDirMeta(path=str(resolved)).sessions_dir / session_id / "kimix-tui.json"
+    return WorkDirMeta(path=str(resolved)).sessions_dir / session_id / STORE_FILENAME
 
 
 class LLMConfigStore:
@@ -231,7 +239,7 @@ class LLMConfigStore:
         *,
         session_file_resolver: SessionConfigFileResolver = session_config_file,
     ) -> None:
-        self.metadata_file = metadata_file or (get_share_dir() / "kimix-tui.json")
+        self.metadata_file = metadata_file or default_store_file()
         self._session_file_resolver = session_file_resolver
         self._data = self._load()
 

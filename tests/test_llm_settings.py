@@ -83,7 +83,7 @@ def config_store(tmp_path: Path) -> LLMConfigStore:
     return LLMConfigStore(
         tmp_path / "metadata.json",
         session_file_resolver=lambda _work_dir, session_id: (
-            tmp_path / "sessions" / session_id / "kimix-tui.json"
+            tmp_path / "sessions" / session_id / "kimix-gui.json"
         ),
     )
 
@@ -188,6 +188,7 @@ def test_home_can_configure_existing_session(qtbot, tmp_path: Path) -> None:
     qtbot.mouseClick(find(home, "configure-session"), Qt.MouseButton.LeftButton)
     dialog = _wait_settings(qtbot, app)
     assert dialog.findChild(QLineEdit, "config-path") is None
+    assert dialog.findChild(QPushButton, "browse-config") is None
     assert dialog.findChild(QPushButton, "load-config") is None
     assert dialog.findChild(QPushButton, "delete-config") is None
     _select_config(dialog, second)
@@ -286,6 +287,63 @@ def test_add_config_does_not_change_project_default(qtbot, tmp_path: Path) -> No
         first.resolve(),
         second.resolve(),
     }
+
+
+def test_settings_browse_adds_json_config(qtbot, tmp_path: Path, monkeypatch) -> None:
+    first, second = config_files(tmp_path)
+    store = config_store(tmp_path)
+    store.set_default(tmp_path, inspect_llm_config(first))
+    captured: dict[str, str] = {}
+
+    def fake_pick(_parent: object, start_directory: str) -> Path:
+        captured["start"] = start_directory
+        return second
+
+    monkeypatch.setattr("kimix_tui.qt.settings_dialog.pick_json_file", fake_pick)
+    app = KimixTuiApp(
+        SessionOptions(tmp_path),
+        session_loader=session_loader,
+        config_store=store,
+    )
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    qtbot.mouseClick(find(home, "open-settings"), Qt.MouseButton.LeftButton)
+    dialog = _wait_settings(qtbot, app)
+    find(dialog, "browse-config", QPushButton).click()
+    assert captured["start"] == str(first.parent)
+    assert find(dialog, "config-path", QLineEdit).text() == str(second.resolve())
+    assert widget_text(dialog, "config-model") == "Second Model"
+    find(dialog, "cancel-settings", QPushButton).click()
+    wait_home(qtbot, app)
+    assert {reference.path for reference in store.configs()} == {
+        first.resolve(),
+        second.resolve(),
+    }
+
+
+def test_settings_browse_cancel_leaves_library_unchanged(
+    qtbot, tmp_path: Path, monkeypatch
+) -> None:
+    first, _second = config_files(tmp_path)
+    store = config_store(tmp_path)
+    store.set_default(tmp_path, inspect_llm_config(first))
+    monkeypatch.setattr(
+        "kimix_tui.qt.settings_dialog.pick_json_file",
+        lambda _parent, _start_directory: None,
+    )
+    app = KimixTuiApp(
+        SessionOptions(tmp_path),
+        session_loader=session_loader,
+        config_store=store,
+    )
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    qtbot.mouseClick(find(home, "open-settings"), Qt.MouseButton.LeftButton)
+    dialog = _wait_settings(qtbot, app)
+    find(dialog, "browse-config", QPushButton).click()
+    assert find(dialog, "config-path", QLineEdit).text() == str(first.resolve())
+    assert widget_text(dialog, "config-model") == "First Model"
+    assert {reference.path for reference in store.configs()} == {first.resolve()}
 
 
 def test_project_settings_can_remove_non_default_config(qtbot, tmp_path: Path) -> None:
