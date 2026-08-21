@@ -6,14 +6,18 @@ import argparse
 import asyncio
 import ctypes
 import gc
+import os
 import random
+import sys
 import tracemalloc
 from pathlib import Path
 
-from textual.app import App, ComposeResult
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PySide6.QtWidgets import QApplication
 
 from kimix_tui.history import Timeline, _scan_wire_history_index
-from kimix_tui.widgets import Transcript
+from kimix_tui.qt.transcript import Transcript
 
 
 def rss_mib() -> float:
@@ -51,25 +55,13 @@ def rss_mib() -> float:
     return counters.WorkingSetSize / 1024**2
 
 
-class TranscriptApp(App[None]):
-    def compose(self) -> ComposeResult:
-        yield Transcript(id="transcript")
-
-
 async def seek_timeline(timeline: Timeline, turn: int) -> list[tuple[str, str, int]]:
     await timeline.ensure_turn(turn)
     return timeline.display_items()
 
 
-def print_stats(prefix: str, step: int, heap_peak: int) -> None:
-    current, peak = tracemalloc.get_traced_memory()
-    print(
-        f"{prefix} step={step} heap={current / 1024**2:.1f}MiB "
-        f"rss={rss_mib():.1f}MiB peak={max(peak, heap_peak) / 1024**2:.1f}MiB"
-    )
-
-
 async def main(path: Path, jumps: int, interval: int, paint: bool) -> None:
+    qt_app = QApplication.instance() or QApplication(sys.argv)
     randomizer = random.Random(246822)
     tracemalloc.start()
     index = await asyncio.to_thread(_scan_wire_history_index, path)
@@ -99,7 +91,6 @@ async def main(path: Path, jumps: int, interval: int, paint: bool) -> None:
             )
 
     await asyncio.sleep(0)
-    await asyncio.sleep(0)
     gc.collect()
     after_loader = tracemalloc.take_snapshot()
     print("loader_top_allocations")
@@ -108,44 +99,40 @@ async def main(path: Path, jumps: int, interval: int, paint: bool) -> None:
 
     print("phase=transcript")
     before_transcript = tracemalloc.take_snapshot()
-    app = TranscriptApp()
-    async with app.run_test(size=(100, 35)) as pilot:
-        transcript = app.query_one(Transcript)
-        await transcript.append_block("system", "Session: diagnostic")
-        transcript.mark_history_window(1, 1)
-        for step in range(jumps):
-            turn = randomizer.randrange(max(1, index.total_turns))
-            items = await seek_timeline(timeline, turn)
-            await transcript.replace_history_blocks(
-                [(kind, text, item_turn) for kind, text, item_turn in items]
+    transcript = Transcript()
+    transcript.resize(800, 560)
+    transcript.show()
+    qt_app.processEvents()
+    transcript.append_block("system", "Session: diagnostic")
+    transcript.mark_history_window(1, 1)
+    for step in range(jumps):
+        turn = randomizer.randrange(max(1, index.total_turns))
+        items = await seek_timeline(timeline, turn)
+        transcript.replace_history_blocks(
+            [(kind, text, item_turn) for kind, text, item_turn in items]
+        )
+        transcript.jump_to_turn(turn)
+        if paint:
+            transcript.visible_text()
+        del items
+        qt_app.processEvents()
+        if step % interval == 0:
+            gc.collect()
+            current, peak = tracemalloc.get_traced_memory()
+            record_chars = sum(len(record.text) for record in transcript.records)
+            print(
+                f"transcript step={step} records={len(transcript.records)} "
+                f"cache={len(transcript._strip_cache)} chars={record_chars / 1024**2:.1f}MiB "
+                f"heap={current / 1024**2:.1f}MiB rss={rss_mib():.1f}MiB "
+                f"peak={peak / 1024**2:.1f}MiB"
             )
-            transcript.jump_to_turn(turn)
-            if paint:
-                for row in range(transcript.size.height):
-                    transcript.render_line(row)
-            del items
-            await pilot.pause()
-            if step % interval == 0:
-                gc.collect()
-                current, peak = tracemalloc.get_traced_memory()
-                strip_count = sum(
-                    len(strips) for strips in transcript._strip_cache.values()
-                )
-                record_chars = sum(len(record.text) for record in transcript.records)
-                print(
-                    f"transcript step={step} records={len(transcript.records)} "
-                    f"strips={strip_count} chars={record_chars / 1024**2:.1f}MiB "
-                    f"heap={current / 1024**2:.1f}MiB rss={rss_mib():.1f}MiB "
-                    f"peak={peak / 1024**2:.1f}MiB"
-                )
 
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        gc.collect()
-        after_transcript = tracemalloc.take_snapshot()
-        print("transcript_top_allocations")
-        for stat in after_transcript.compare_to(before_transcript, "lineno")[:12]:
-            print(stat)
+    await asyncio.sleep(0)
+    gc.collect()
+    after_transcript = tracemalloc.take_snapshot()
+    print("transcript_top_allocations")
+    for stat in after_transcript.compare_to(before_transcript, "lineno")[:12]:
+        print(stat)
 
 
 if __name__ == "__main__":

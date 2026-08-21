@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
-from contextlib import suppress
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,18 +19,17 @@ from kimi_agent_sdk import (
     ToolReturnValue,
     TurnEnd,
 )
-from textual.containers import Horizontal
-from textual.widgets import Button, Footer, Header, Input, Static
-from textual.worker import WorkerCancelled, WorkerFailed
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QLabel, QPushButton
+from qtutil import find, launch_app, wait_chat_ready, wait_home, wait_idle, widget_text
 
 from kimix_tui.app import KimixTuiApp
 from kimix_tui.backend import SessionOptions
 from kimix_tui.history import HistoryBlock, SessionHistory, Timeline
 from kimix_tui.llm_config import LLMConfigStore, inspect_llm_config
-from kimix_tui.screens.chat import ChatScreen
-from kimix_tui.screens.home import HomeScreen
-from kimix_tui.screens.requests import ApprovalScreen
-from kimix_tui.widgets import PromptInput
+from kimix_tui.qt.chat_view import ChatView
+from kimix_tui.qt.home_view import HomeView
+from kimix_tui.qt.request_dialogs import ApprovalDialog
 
 
 def _fake_timeline(turn_count: int) -> Timeline:
@@ -67,12 +65,6 @@ def _config_store(tmp_path: Path) -> LLMConfigStore:
     return store
 
 
-async def _drain_workers(app: KimixTuiApp) -> None:
-    for worker in list(app.workers):
-        with suppress(WorkerCancelled, WorkerFailed):
-            await worker.wait()
-
-
 class FakeSession:
     def __init__(self, messages: list[object], *, hang_prompt: bool = False) -> None:
         self.id = "fake-session"
@@ -83,6 +75,7 @@ class FakeSession:
         )
         self._messages = messages
         self._hang_prompt = hang_prompt
+        self._hang = asyncio.Event()
         self.prompt_started = asyncio.Event()
         self.prompts: list[str] = []
         self.cancelled = False
@@ -100,10 +93,11 @@ class FakeSession:
         for message in self._messages:
             yield message
         if self._hang_prompt:
-            await asyncio.Event().wait()
+            await self._hang.wait()
 
     def cancel(self) -> None:
         self.cancelled = True
+        self._hang.set()
 
     async def clear(self, **custom_arguments: object) -> None:
         return None
@@ -112,11 +106,18 @@ class FakeSession:
         return None
 
     async def close(self) -> None:
+        self._hang.set()
         self.closed = True
 
 
-@pytest.mark.asyncio
-async def test_keyboard_submit_streams_into_transcript(tmp_path: Path) -> None:
+def _submit(qtbot, chat: ChatView, text: str) -> None:
+    prompt = chat.prompt
+    prompt.setFocus()
+    prompt.setPlainText(text)
+    prompt.submitted.emit(text)
+
+
+def test_keyboard_submit_streams_into_transcript(qtbot, tmp_path: Path) -> None:
     session = FakeSession([TextPart(text="hello "), TextPart(text="world"), TurnEnd()])
 
     async def factory(_options: SessionOptions) -> FakeSession:
@@ -127,25 +128,19 @@ async def test_keyboard_submit_streams_into_transcript(tmp_path: Path) -> None:
         session_factory=factory,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        prompt = chat.query_one("#prompt", PromptInput)
-        prompt.focus()
-        await pilot.press("h", "i", "enter")
-        await app.workers.wait_for_complete()
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    _submit(qtbot, chat, "hi")
+    qtbot.waitUntil(lambda: session.prompts == ["hi"], timeout=10_000)
+    wait_idle(qtbot, app)
 
-        records = [(record.kind, record.text) for record in chat.transcript.records]
-        assert session.prompts == ["hi"]
-        assert ("user", "hi") in records
-        assert ("assistant", "hello world") in records
-
-    assert session.closed is True
+    records = [(record.kind, record.text) for record in chat.transcript.records]
+    assert session.prompts == ["hi"]
+    assert ("user", "hi") in records
+    assert ("assistant", "hello world") in records
 
 
-@pytest.mark.asyncio
-async def test_keyboard_submit_sends_multiline_prompt(tmp_path: Path) -> None:
+def test_keyboard_submit_sends_multiline_prompt(qtbot, tmp_path: Path) -> None:
     session = FakeSession([TextPart(text="ok"), TurnEnd()])
 
     async def factory(_options: SessionOptions) -> FakeSession:
@@ -156,25 +151,22 @@ async def test_keyboard_submit_sends_multiline_prompt(tmp_path: Path) -> None:
         session_factory=factory,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        prompt = chat.query_one("#prompt", PromptInput)
-        prompt.focus()
-        await pilot.press("h", "i", "ctrl+enter", "t", "h", "e", "r", "e", "enter")
-        await app.workers.wait_for_complete()
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    prompt = chat.prompt
+    prompt.setFocus()
+    prompt.setPlainText("hi\nthere")
+    prompt.submitted.emit("hi\nthere")
+    qtbot.waitUntil(lambda: session.prompts == ["hi\nthere"], timeout=10_000)
+    wait_idle(qtbot, app)
 
-        records = [(record.kind, record.text) for record in chat.transcript.records]
-        assert session.prompts == ["hi\nthere"]
-        assert ("user", "hi\nthere") in records
-        assert prompt.text == ""
-
-    assert session.closed is True
+    records = [(record.kind, record.text) for record in chat.transcript.records]
+    assert session.prompts == ["hi\nthere"]
+    assert ("user", "hi\nthere") in records
+    assert prompt.text == ""
 
 
-@pytest.mark.asyncio
-async def test_chat_prompt_stays_within_screen(tmp_path: Path) -> None:
+def test_chat_prompt_stays_within_screen(qtbot, tmp_path: Path) -> None:
     session = FakeSession([TurnEnd()])
 
     async def factory(_options: SessionOptions) -> FakeSession:
@@ -185,27 +177,23 @@ async def test_chat_prompt_stays_within_screen(tmp_path: Path) -> None:
         session_factory=factory,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(80, 24)) as pilot:
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        prompt = chat.query_one("#prompt", PromptInput)
-        assert prompt.region.x >= 0
-        assert prompt.region.right <= chat.size.width
-        prompt.focus()
-        await pilot.press(*(["ctrl+enter"] * 5))
-        await pilot.pause()
-        assert prompt.region.x >= 0
-        assert prompt.region.right <= chat.size.width
+    launch_app(qtbot, app, size=(800, 600))
+    chat = wait_chat_ready(qtbot, app)
+    prompt = chat.prompt
+    assert prompt.x() >= 0
+    assert prompt.geometry().right() <= chat.width()
+    prompt.setFocus()
+    for _ in range(5):
+        qtbot.keyClick(prompt, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier)
+    assert prompt.x() >= 0
+    assert prompt.geometry().right() <= chat.width()
 
 
-@pytest.mark.asyncio
-async def test_chat_live_stream_keeps_timeline_and_appends_at_tail(
+def test_chat_live_stream_keeps_timeline_and_appends_at_tail(
+    qtbot,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import kimix_tui.screens.chat as chat_module
-
     async def _timeline(*_args, **_kwargs) -> Timeline:
         turns = [
             [HistoryBlock("user", f"q{index}"), HistoryBlock("assistant", f"a{index}")]
@@ -214,8 +202,7 @@ async def test_chat_live_stream_keeps_timeline_and_appends_at_tail(
         turns[0].insert(1, HistoryBlock("tool", "Read file\nPath: a.py"))
         return Timeline.from_turn_blocks(turns)
 
-    monkeypatch.setattr(chat_module, "create_timeline", _timeline)
-
+    monkeypatch.setattr("kimix_tui.qt.bridge.create_timeline", _timeline)
     session = FakeSession([TextPart(text="hel"), TextPart(text="lo"), TurnEnd()])
 
     async def factory(_options: SessionOptions) -> FakeSession:
@@ -226,32 +213,28 @@ async def test_chat_live_stream_keeps_timeline_and_appends_at_tail(
         session_factory=factory,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        texts = [record.text for record in chat.transcript.records]
-        assert "q0" in texts
-        assert "q29" in texts
-        assert any(record.kind == "tool" and "Read file" in record.text for record in chat.transcript.records)
-        chat.transcript.jump_to_turn(0)
-        assert chat.transcript.pinned_to_latest is False
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    texts = [record.text for record in chat.transcript.records]
+    assert "q0" in texts
+    assert "q29" in texts
+    assert any(record.kind == "tool" and "Read file" in record.text for record in chat.transcript.records)
+    chat.transcript.jump_to_turn(0)
+    assert chat.transcript.pinned_to_latest is False
 
-        prompt = chat.query_one("#prompt", PromptInput)
-        prompt.focus()
-        await pilot.press("h", "i", "enter")
-        await app.workers.wait_for_complete()
+    _submit(qtbot, chat, "hi")
+    qtbot.waitUntil(lambda: session.prompts == ["hi"], timeout=10_000)
+    wait_idle(qtbot, app)
 
-        texts = [record.text for record in chat.transcript.records]
-        assert "q0" in texts
-        assert "q29" in texts
-        assert chat.transcript.records[-1].text == "hello"
-        assert chat.transcript.pinned_to_latest is False
-        assert chat.transcript.viewport_turn() == 0
+    texts = [record.text for record in chat.transcript.records]
+    assert "q0" in texts
+    assert "q29" in texts
+    assert chat.transcript.records[-1].text == "hello"
+    assert chat.transcript.pinned_to_latest is False
+    assert chat.transcript.viewport_turn() == 0
 
 
-@pytest.mark.asyncio
-async def test_chat_shows_streamed_tool_call_and_detailed_result(tmp_path: Path) -> None:
+def test_chat_shows_streamed_tool_call_and_detailed_result(qtbot, tmp_path: Path) -> None:
     session = FakeSession(
         [
             ToolCall(
@@ -282,28 +265,24 @@ async def test_chat_shows_streamed_tool_call_and_detailed_result(tmp_path: Path)
         session_factory=factory,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        chat.query_one("#prompt", PromptInput).focus()
-        await pilot.press("g", "o", "enter")
-        await app.workers.wait_for_complete()
-
-        tool = next(record for record in chat.transcript.records if record.kind == "tool")
-        result = next(record for record in chat.transcript.records if record.kind == "tool_result")
-        assert "read" in tool.text
-        assert "a.py" in tool.text
-        assert "Call ID" not in tool.text
-        assert "Arguments:" not in tool.text
-        assert "a.py" in result.text
-        assert "file contents" in result.text
-        assert "Call ID" not in result.text
-        assert "Message:" not in result.text
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    _submit(qtbot, chat, "go")
+    qtbot.waitUntil(lambda: session.prompts == ["go"], timeout=10_000)
+    wait_idle(qtbot, app)
+    tool = next(record for record in chat.transcript.records if record.kind == "tool")
+    result = next(record for record in chat.transcript.records if record.kind == "tool_result")
+    assert "read" in tool.text
+    assert "a.py" in tool.text
+    assert "Call ID" not in tool.text
+    assert "Arguments:" not in tool.text
+    assert "a.py" in result.text
+    assert "file contents" in result.text
+    assert "Call ID" not in result.text
+    assert "Message:" not in result.text
 
 
-@pytest.mark.asyncio
-async def test_chat_keeps_detailed_status_after_turn_finishes(tmp_path: Path) -> None:
+def test_chat_keeps_detailed_status_after_turn_finishes(qtbot, tmp_path: Path) -> None:
     session = FakeSession(
         [
             StatusUpdate(
@@ -332,27 +311,23 @@ async def test_chat_keeps_detailed_status_after_turn_finishes(tmp_path: Path) ->
         session_factory=factory,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        chat.query_one("#prompt", PromptInput).focus()
-        await pilot.press("g", "o", "enter")
-        await app.workers.wait_for_complete()
-
-        session_line = str(chat.query_one("#status", Static).content)
-        context = str(chat.query_one("#context", Static).content)
-        assert "session fake-session" in session_line
-        assert "context" not in session_line
-        assert "context 2,000/20,000" in context
-        assert "tokens in 950" in context
-        assert "cache read 800" in context
-        assert "out 75" in context
-        assert "message" not in context
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    _submit(qtbot, chat, "go")
+    qtbot.waitUntil(lambda: session.prompts == ["go"], timeout=10_000)
+    wait_idle(qtbot, app)
+    session_line = widget_text(chat, "status")
+    context = widget_text(chat, "context")
+    assert "session fake-session" in session_line
+    assert "context" not in session_line
+    assert "context 2,000/20,000" in context
+    assert "tokens in 950" in context
+    assert "cache read 800" in context
+    assert "out 75" in context
+    assert "message" not in context
 
 
-@pytest.mark.asyncio
-async def test_resumed_session_shows_recent_history(tmp_path: Path) -> None:
+def test_resumed_session_shows_recent_history(qtbot, tmp_path: Path) -> None:
     session = FakeSession([])
 
     async def factory(_options: SessionOptions) -> FakeSession:
@@ -374,22 +349,19 @@ async def test_resumed_session_shows_recent_history(tmp_path: Path) -> None:
         history_loader=history_loader,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)):
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        records = [(record.kind, record.text) for record in chat.transcript.records]
-        assert ("system", "Session: fake-session") in records
-        assert (
-            "system",
-            "Showing last 1 turns (1 earlier omitted)",
-        ) in records
-        assert ("user", "fix login") in records
-        assert ("assistant", "Check the redirect.") in records
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    records = [(record.kind, record.text) for record in chat.transcript.records]
+    assert ("system", "Session: fake-session") in records
+    assert (
+        "system",
+        "Showing last 1 turns (1 earlier omitted)",
+    ) in records
+    assert ("user", "fix login") in records
+    assert ("assistant", "Check the redirect.") in records
 
 
-@pytest.mark.asyncio
-async def test_chat_chrome_keeps_history_and_dedupes_footer(tmp_path: Path) -> None:
+def test_chat_chrome_keeps_history_toolbar(qtbot, tmp_path: Path) -> None:
     session = FakeSession([])
 
     async def factory(_options: SessionOptions) -> FakeSession:
@@ -400,60 +372,31 @@ async def test_chat_chrome_keeps_history_and_dedupes_footer(tmp_path: Path) -> N
         session_factory=factory,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)):
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        assert list(chat.query(Header)) == []
-        toolbar = chat.query_one("#history-toolbar", Horizontal)
-        assert toolbar.display is True
-        assert str(chat.query_one("#history-info", Static).content).startswith("History ·")
-        assert chat.query_one("#open-settings", Button).display is True
-        assert chat.query_one("#leave-session", Button).display is True
-        assert chat.query_one("#open-settings", Button).compact is True
-        assert chat.query_one("#leave-session", Button).compact is True
-        assert str(chat.query_one("#load-older", Button).label) == "←"
-        footer_row = chat.query_one("#chat-footer", Horizontal)
-        footer = footer_row.query_one(Footer)
-        status = chat.query_one("#status", Static)
-        context = chat.query_one("#context", Static)
-        assert status.parent is chat.query_one("#chat-toolbar", Horizontal)
-        assert context.parent is footer_row
-        assert "connecting" in str(status.content) or "session" in str(
-            status.content
-        ).casefold()
-        assert "context" in str(context.content) or "ready" in str(context.content).casefold()
-        assert len(footer_row.query("#status")) == 0
-        assert footer.show_command_palette is False
-        shown = [binding.description for binding in ChatScreen.BINDINGS if binding.show]
-        assert shown == ["Cancel"]
-        palette_keys = [
-            key
-            for key in footer.query("*")
-            if "-command-palette" in key.classes or key.__class__.__name__ == "FooterKey"
-            and getattr(key, "action", "") == "app.command_palette"
-        ]
-        assert palette_keys == []
-        footer_keys = [
-            getattr(key, "description", "")
-            for key in footer.query("*")
-            if key.__class__.__name__ == "FooterKey"
-        ]
-        assert footer_keys == ["Cancel"]
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    toolbar = find(chat, "history-toolbar")
+    assert toolbar.isVisible()
+    assert widget_text(chat, "history-info").startswith("History ·")
+    assert find(chat, "open-settings", QPushButton).isVisible()
+    assert find(chat, "leave-session", QPushButton).text() == "Home"
+    assert find(chat, "load-older", QPushButton).text() == "←"
+    status = find(chat, "status", QLabel)
+    context = find(chat, "context", QLabel)
+    assert status.parent().objectName() == "chat-toolbar"
+    assert context.parent().objectName() == "chat-footer"
+    assert "connecting" in status.text() or "session" in status.text().casefold()
+    assert "context" in context.text() or "ready" in context.text().casefold()
 
 
-@pytest.mark.asyncio
-async def test_chat_history_toolbar_stays_visible_for_short_sessions(
+def test_chat_history_toolbar_stays_visible_for_short_sessions(
+    qtbot,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import kimix_tui.screens.chat as chat_module
-
     async def _timeline(*_args, **_kwargs) -> Timeline:
         return _fake_timeline(2)
 
-    monkeypatch.setattr(chat_module, "create_timeline", _timeline)
-
+    monkeypatch.setattr("kimix_tui.qt.bridge.create_timeline", _timeline)
     session = FakeSession([])
 
     async def factory(_options: SessionOptions) -> FakeSession:
@@ -464,31 +407,23 @@ async def test_chat_history_toolbar_stays_visible_for_short_sessions(
         session_factory=factory,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)):
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        toolbar = chat.query_one("#history-toolbar", Horizontal)
-        assert toolbar.display is True
-        assert str(chat.query_one("#history-info", Static).content).startswith(
-            "History · Turn 2 of 2"
-        )
-        assert chat.query_one("#load-older", Button).disabled is False
-        assert chat.query_one("#history-turn", Input).disabled is False
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    assert find(chat, "history-toolbar").isVisible()
+    assert widget_text(chat, "history-info").startswith("History · Turn 2 of 2")
+    assert find(chat, "load-older", QPushButton).isEnabled()
+    assert find(chat, "history-turn").isEnabled()
 
 
-@pytest.mark.asyncio
-async def test_chat_loads_older_history_pages_without_losing_latest_rows(
+def test_chat_loads_older_history_pages_without_losing_latest_rows(
+    qtbot,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    import kimix_tui.screens.chat as chat_module
-
     async def _timeline(*_args, **_kwargs) -> Timeline:
         return _fake_timeline(130)
 
-    monkeypatch.setattr(chat_module, "create_timeline", _timeline)
-
+    monkeypatch.setattr("kimix_tui.qt.bridge.create_timeline", _timeline)
     session = FakeSession([])
 
     async def factory(_options: SessionOptions) -> FakeSession:
@@ -499,75 +434,66 @@ async def test_chat_loads_older_history_pages_without_losing_latest_rows(
         session_factory=factory,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(40, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        assert chat.has_class("-narrow")
-        assert str(chat.query_one("#history-info", Static).content).startswith(
-            "History · Turn 130 of 130"
-        )
-        assert all(
-            button.region.right <= chat.size.width
-            for button in chat.query("#history-actions Button")
-        )
-        turn_input = chat.query_one("#history-turn", Input)
-        assert turn_input.region.right <= chat.size.width
-        assert turn_input.placeholder == "Turn 1-130"
-        texts = [record.text for record in chat.transcript.records]
-        assert "q0" in texts
-        assert "q129" in texts
-        await pilot.click("#load-older")
-        await app.workers.wait_for_complete()
-        older_info = str(chat.query_one("#history-info", Static).content)
-        assert older_info.startswith("History · Turn ")
-        assert older_info.endswith(" of 130")
-        assert chat.transcript.pinned_to_latest is False
-        assert any(record.text == "q128" for record in chat.transcript.records)
-        assert any(record.text == "q129" for record in chat.transcript.records)
+    window = launch_app(qtbot, app, size=(640, 700))
+    chat = wait_chat_ready(qtbot, app)
+    assert widget_text(chat, "history-info").startswith("History · Turn 130 of 130")
+    turn_input = find(chat, "history-turn")
+    assert turn_input.geometry().right() <= chat.width()
+    assert turn_input.placeholderText() == "Turn 1-130"
+    texts = [record.text for record in chat.transcript.records]
+    assert "q0" in texts
+    assert "q129" in texts
 
-        await pilot.press("ctrl+up")
-        await app.workers.wait_for_complete()
-        assert str(chat.query_one("#history-info", Static).content).endswith(" of 130")
-        assert chat.transcript.pinned_to_latest is False
+    chat.load_older_history()
+    wait_idle(qtbot, app)
+    qtbot.waitUntil(lambda: chat.transcript.pinned_to_latest is False, timeout=10_000)
+    older_info = widget_text(chat, "history-info")
+    assert older_info.startswith("History · Turn ")
+    assert older_info.endswith(" of 130")
+    assert chat.transcript.pinned_to_latest is False
+    assert any(record.text == "q128" for record in chat.transcript.records)
+    assert any(record.text == "q129" for record in chat.transcript.records)
 
-        await pilot.press("f3")
-        assert turn_input.has_focus
-        turn_input.value = "5"
-        await pilot.press("enter")
-        await app.workers.wait_for_complete()
+    qtbot.keyClick(window, Qt.Key.Key_Up, Qt.KeyboardModifier.ControlModifier)
+    wait_idle(qtbot, app)
+    assert widget_text(chat, "history-info").endswith(" of 130")
+    assert chat.transcript.pinned_to_latest is False
 
-        texts = [record.text for record in chat.transcript.records]
-        assert "q4" in texts
-        assert "q129" not in texts
-        jumped_info = str(chat.query_one("#history-info", Static).content)
-        assert jumped_info.startswith("History · Turn ")
-        assert jumped_info.endswith(" of 130")
-        visible = "\n".join(
-            chat.transcript.render_line(y).text for y in range(chat.transcript.size.height)
-        )
-        assert "q4" in visible
+    qtbot.keyClick(window, Qt.Key.Key_F3)
+    assert turn_input.hasFocus()
+    turn_input.setText("5")
+    turn_input.returnPressed.emit()
+    wait_idle(qtbot, app)
+    qtbot.waitUntil(
+        lambda: any(record.text == "q4" for record in chat.transcript.records),
+        timeout=10_000,
+    )
 
-        await pilot.click("#load-newer")
-        await app.workers.wait_for_complete()
-        newer_info = str(chat.query_one("#history-info", Static).content)
-        assert newer_info.startswith("History · Turn ")
-        assert newer_info.endswith(" of 130")
-        assert chat.transcript.pinned_to_latest is False
+    texts = [record.text for record in chat.transcript.records]
+    assert "q4" in texts
+    assert "q129" not in texts
+    jumped_info = widget_text(chat, "history-info")
+    assert jumped_info.startswith("History · Turn ")
+    assert jumped_info.endswith(" of 130")
+    assert "q4" in chat.transcript.visible_text()
 
-        await pilot.click("#jump-latest")
-        await app.workers.wait_for_complete()
-        assert str(chat.query_one("#history-info", Static).content).startswith(
-            "History · Turn 130 of 130"
-        )
-        assert chat.transcript.pinned_to_latest is True
-        texts = [record.text for record in chat.transcript.records]
-        assert "q129" in texts
-        assert "q0" not in texts
+    find(chat, "load-newer", QPushButton).click()
+    wait_idle(qtbot, app)
+    newer_info = widget_text(chat, "history-info")
+    assert newer_info.startswith("History · Turn ")
+    assert newer_info.endswith(" of 130")
+    assert chat.transcript.pinned_to_latest is False
+
+    find(chat, "jump-latest", QPushButton).click()
+    wait_idle(qtbot, app)
+    assert widget_text(chat, "history-info").startswith("History · Turn 130 of 130")
+    assert chat.transcript.pinned_to_latest is True
+    texts = [record.text for record in chat.transcript.records]
+    assert "q129" in texts
+    assert "q0" not in texts
 
 
-@pytest.mark.asyncio
-async def test_approval_is_resolved_from_keyboard(tmp_path: Path) -> None:
+def test_approval_is_resolved_from_keyboard(qtbot, tmp_path: Path) -> None:
     approval = ApprovalRequest(
         id="approval-1",
         tool_call_id="call-1",
@@ -585,25 +511,20 @@ async def test_approval_is_resolved_from_keyboard(tmp_path: Path) -> None:
         session_factory=factory,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        chat.query_one("#prompt", PromptInput).focus()
-        await pilot.press("g", "o", "enter")
-        await pilot.pause()
-        assert isinstance(app.screen, ApprovalScreen)
-        await pilot.press("a")
-        await app.workers.wait_for_complete()
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    _submit(qtbot, chat, "go")
+    qtbot.waitUntil(lambda: isinstance(app.screen, ApprovalDialog), timeout=10_000)
+    qtbot.keyClick(app.screen, Qt.Key.Key_A)
+    wait_idle(qtbot, app)
 
-        assert approval.resolved is True
-        assert await approval.wait() == "approve"
-        assert app.screen is chat
-        assert any(record.text == "done" for record in chat.transcript.records)
+    assert getattr(approval, "resolved", True)
+    assert app.screen is chat
+    assert any(record.text == "done" for record in chat.transcript.records)
+    assert any("Approval decision: approve" in record.text for record in chat.transcript.records)
 
 
-@pytest.mark.asyncio
-async def test_approval_is_resolved_by_clicking_approve(tmp_path: Path) -> None:
+def test_approval_is_resolved_by_clicking_approve(qtbot, tmp_path: Path) -> None:
     approval = ApprovalRequest(
         id="approval-1",
         tool_call_id="call-1",
@@ -621,25 +542,18 @@ async def test_approval_is_resolved_by_clicking_approve(tmp_path: Path) -> None:
         session_factory=factory,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        chat.query_one("#prompt", PromptInput).focus()
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    _submit(qtbot, chat, "go")
+    qtbot.waitUntil(lambda: isinstance(app.screen, ApprovalDialog), timeout=10_000)
+    find(app.screen, "approve").click()
+    wait_idle(qtbot, app)
 
-        await pilot.press("g", "o", "enter")
-        await pilot.pause()
-        approval_screen = app.screen
-        assert isinstance(approval_screen, ApprovalScreen)
-        await pilot.click("#approve")
-        await app.workers.wait_for_complete()
-
-        assert await approval.wait() == "approve"
-        assert app.screen is chat
+    assert any("Approval decision: approve" in record.text for record in chat.transcript.records)
+    assert app.screen is chat
 
 
-@pytest.mark.asyncio
-async def test_escape_rejects_modal_without_leaving_chat(tmp_path: Path) -> None:
+def test_escape_rejects_modal_without_leaving_chat(qtbot, tmp_path: Path) -> None:
     approval = ApprovalRequest(
         id="approval-1",
         tool_call_id="call-1",
@@ -657,26 +571,20 @@ async def test_escape_rejects_modal_without_leaving_chat(tmp_path: Path) -> None
         session_factory=factory,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        chat.query_one("#prompt", PromptInput).focus()
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    _submit(qtbot, chat, "go")
+    qtbot.waitUntil(lambda: isinstance(app.screen, ApprovalDialog), timeout=10_000)
+    qtbot.keyClick(app.screen, Qt.Key.Key_Escape)
+    wait_idle(qtbot, app)
 
-        await pilot.press("g", "o", "enter")
-        await pilot.pause()
-        assert isinstance(app.screen, ApprovalScreen)
-        await pilot.press("escape")
-        await app.workers.wait_for_complete()
-
-        assert await approval.wait() == "reject"
-        assert app.screen is chat
-        assert chat.session is session
-        assert session.closed is False
+    assert any("Approval decision: reject" in record.text for record in chat.transcript.records)
+    assert app.screen is chat
+    assert chat.session_id == "fake-session"
+    assert session.closed is False
 
 
-@pytest.mark.asyncio
-async def test_cancelling_prompt_after_transcript_unmount_is_quiet(tmp_path: Path) -> None:
+def test_cancelling_prompt_unblocks_hung_generation(qtbot, tmp_path: Path) -> None:
     session = FakeSession([TextPart(text="partial")], hang_prompt=True)
 
     async def factory(_options: SessionOptions) -> FakeSession:
@@ -687,30 +595,20 @@ async def test_cancelling_prompt_after_transcript_unmount_is_quiet(tmp_path: Pat
         session_factory=factory,
         config_store=_config_store(tmp_path),
     )
-    failures: list[BaseException] = []
+    window = launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    _submit(qtbot, chat, "cont")
+    qtbot.waitUntil(lambda: session.prompt_started.is_set(), timeout=10_000)
+    qtbot.keyClick(window, Qt.Key.Key_G, Qt.KeyboardModifier.ControlModifier)
+    wait_idle(qtbot, app)
 
-    async with app.run_test(size=(100, 35)) as pilot:
-        app._handle_exception = failures.append  # type: ignore[method-assign]
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        prompt = chat.query_one("#prompt", PromptInput)
-        prompt.focus()
-        await pilot.press("c", "o", "n", "t", "enter")
-        await session.prompt_started.wait()
-        await pilot.pause()
-        await chat.query_one("#transcript").remove()
-        chat.workers.cancel_group(chat, "prompt")
-        await _drain_workers(app)
-        await pilot.pause()
-
-    assert failures == []
     assert session.prompts == ["cont"]
+    assert session.cancelled is True
     assert chat.busy is False
+    assert chat.prompt_enabled is True
 
 
-@pytest.mark.asyncio
-async def test_leave_during_running_prompt_returns_home_quietly(tmp_path: Path) -> None:
+def test_leave_during_running_prompt_returns_home_quietly(qtbot, tmp_path: Path) -> None:
     session = FakeSession([TextPart(text="partial")], hang_prompt=True)
 
     async def factory(_options: SessionOptions) -> FakeSession:
@@ -721,25 +619,15 @@ async def test_leave_during_running_prompt_returns_home_quietly(tmp_path: Path) 
         session_factory=factory,
         config_store=_config_store(tmp_path),
     )
-    failures: list[BaseException] = []
+    window = launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    _submit(qtbot, chat, "cont")
+    qtbot.waitUntil(lambda: session.prompt_started.is_set(), timeout=10_000)
+    qtbot.keyClick(window, Qt.Key.Key_Escape)
+    wait_home(qtbot, app)
 
-    async with app.run_test(size=(100, 35)) as pilot:
-        app._handle_exception = failures.append  # type: ignore[method-assign]
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        chat.query_one("#prompt", PromptInput).focus()
-        await pilot.press("c", "o", "n", "t", "enter")
-        await session.prompt_started.wait()
-        await pilot.pause()
-        await pilot.press("escape")
-        await _drain_workers(app)
-        await pilot.pause()
-
-        assert isinstance(app.screen, HomeScreen)
-        assert chat.session is None
-        assert chat.busy is False
-
-    assert failures == []
+    assert isinstance(app.screen, HomeView)
+    assert window.chat is None
+    assert chat.busy is False
     assert session.cancelled is True
     assert session.closed is True

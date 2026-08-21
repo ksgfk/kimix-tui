@@ -1,9 +1,9 @@
 """Local memory-growth simulation for kimix-tui.
 
 Simulates many real chat conversations end-to-end WITHOUT any network request:
-it drives the actual Textual app (Home <-> Chat) with fake SDK sessions.  Every
+it drives the PySide6 app (Home <-> Chat) with fake SDK sessions.  Every
 conversation is opened (session factory), used (session.prompt -> render ->
-Transcript), then left (/quit -> release_session -> close), exactly like a user.
+Transcript), then left (Esc -> close_session), exactly like a user.
 
 Reads process working-set size on Windows (workset) and also prints the capped
 Transcript budget so we can see whether the design bounds resident memory.
@@ -16,24 +16,27 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import ctypes
 import gc
 import json
+import os
 import sys
+import time
 import tracemalloc
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 from kimi_agent_sdk import TextPart, TurnBegin, TurnEnd
+from PySide6.QtWidgets import QApplication
 
 from kimix_tui.app import KimixTuiApp
 from kimix_tui.backend import SessionOptions
 from kimix_tui.llm_config import LLMConfigStore, inspect_llm_config
-from kimix_tui.screens.chat import ChatScreen
-from kimix_tui.screens.home import HomeScreen
-from kimix_tui.widgets import PromptInput
+from kimix_tui.qt.chat_view import ChatView
+from kimix_tui.qt.home_view import HomeView
 
 
 def _rss_mib() -> float:
@@ -74,10 +77,7 @@ def _rss_mib() -> float:
 
 
 class FakeSession:
-    """A session that streams a fixed, locally-generated conversation.
-
-    No network is involved: it just yields TextPart / Turn messages.
-    """
+    """A session that streams a fixed, locally-generated conversation."""
 
     def __init__(self, session_id: str, turns: int, chars: int) -> None:
         self.id = session_id
@@ -103,7 +103,6 @@ class FakeSession:
         assert merge_wire_messages is False
         for _ in range(self._turns):
             yield TurnBegin(user_input=user_input)
-            # stream in chunks like a real model
             chunk = 64
             for start in range(0, self._chars, chunk):
                 yield TextPart(text=self._line[start : start + chunk])
@@ -144,15 +143,27 @@ def _make_config_store(tmp_path: Path) -> LLMConfigStore:
     return store
 
 
-async def _sample(app: KimixTuiApp, label: str, i: int) -> None:
+def _wait_idle(app: KimixTuiApp, timeout: float = 8.0) -> None:
+    deadline = time.monotonic() + timeout
+    qt_app = QApplication.instance()
+    assert qt_app is not None
+    while time.monotonic() < deadline:
+        qt_app.processEvents()
+        if app.bridge.is_idle():
+            return
+        time.sleep(0.01)
+    raise TimeoutError("bridge did not become idle")
+
+
+def _sample(app: KimixTuiApp, label: str, i: int) -> None:
     gc.collect()
     current, peak = tracemalloc.get_traced_memory()
     chat = app.screen
     records = 0
     chars = 0
-    if isinstance(chat, ChatScreen):
+    if isinstance(chat, ChatView):
         records = len(chat.transcript.records)
-        chars = sum(len(r.text) for r in chat.transcript.records)
+        chars = sum(len(record.text) for record in chat.transcript.records)
     print(
         f"{label} i={i} screen={type(app.screen).__name__} "
         f"records={records} chars={chars / 1024**2:.2f}MiB "
@@ -161,16 +172,14 @@ async def _sample(app: KimixTuiApp, label: str, i: int) -> None:
     )
 
 
-async def main(args: argparse.Namespace) -> None:
+def main(args: argparse.Namespace) -> None:
     tracemalloc.start()
     tmp_path = Path(args.work_dir)
     tmp_path.mkdir(parents=True, exist_ok=True)
     config_store = _make_config_store(tmp_path)
-
     sessions_created: list[FakeSession] = []
 
     def make_session(session_id: str) -> FakeSession:
-        # alternate between short and large responses to exercise trimming
         session = FakeSession(session_id, args.turns, args.chars)
         sessions_created.append(session)
         return session
@@ -181,72 +190,76 @@ async def main(args: argparse.Namespace) -> None:
         factory_calls.append(options.session_id or "?")
         return make_session(f"tui_{len(factory_calls)}")
 
+    qt_app = QApplication.instance() or QApplication(sys.argv)
     app = KimixTuiApp(
         SessionOptions(tmp_path),
         session_factory=factory,
         config_store=config_store,
     )
+    window = app.create_window()
+    window.resize(1000, 700)
+    window.show()
+    _wait_idle(app)
+    _sample(app, "start", 0)
 
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        await _sample(app, "start", 0)
-
-        for i in range(1, args.sessions + 1):
-            home = app.screen
-            if not isinstance(home, HomeScreen):
-                raise TypeError(f"unexpected screen: {type(app.screen).__name__}")
-            # Open a brand new session from the home screen.
-            await pilot.click("#start-new-session")
-            await app.workers.wait_for_complete()
-            await pilot.pause()
-            chat = app.screen
-            if not isinstance(chat, ChatScreen):
-                raise TypeError(f"expected ChatScreen, got {type(app.screen).__name__}")
-            prompt = chat.query_one("#prompt", PromptInput)
-            prompt.focus()
-
-            # Say a few things like a user would.
-            for t in range(args.prompts):
-                await pilot.press("g", "r", "e", "e", "t", "i", "n", "g", "enter")
-                await app.workers.wait_for_complete()
-                await pilot.pause()
-
-            if i % args.sample_every == 0:
-                await _sample(app, "in_chat", i)
-
-            # Leave back to home (/quit) which releases + closes the session.
-            await pilot.press("escape")
-            await app.workers.wait_for_complete()
-            await pilot.pause()
-            # escape on chat triggers leave_session -> dismiss back to home
-            assert isinstance(app.screen, HomeScreen), type(app.screen).__name__
-
-            if i % args.sample_every == 0:
-                await _sample(app, "after_leave", i)
-
-        # One very long conversation to check the transcript cap is respected.
-        print("phase=one_long_conversation")
-        await pilot.click("#start-new-session")
-        await app.workers.wait_for_complete()
-        await pilot.pause()
+    for i in range(1, args.sessions + 1):
+        home = app.screen
+        if not isinstance(home, HomeView):
+            raise TypeError(f"unexpected screen: {type(app.screen).__name__}")
+        home.request_new_session()
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            qt_app.processEvents()
+            if isinstance(app.screen, ChatView) and app.screen.prompt_enabled and app.bridge.is_idle():
+                break
+            time.sleep(0.01)
         chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        prompt = chat.query_one("#prompt", PromptInput)
-        prompt.focus()
-        for turn in range(args.long_turns):
-            await pilot.press("g", "r", "e", "e", "t", "i", "n", "g", "enter")
-            await app.workers.wait_for_complete()
-            await pilot.pause()
-            if (turn + 1) % args.sample_every == 0:
-                await _sample(app, "long", turn + 1)
+        if not isinstance(chat, ChatView):
+            raise TypeError(f"expected ChatView, got {type(app.screen).__name__}")
+        prompt = chat.prompt
+        prompt.setFocus()
+        for _t in range(args.prompts):
+            prompt.setPlainText("greeting")
+            prompt.submitted.emit("greeting")
+            _wait_idle(app)
+        if i % args.sample_every == 0:
+            _sample(app, "in_chat", i)
+        app.leave_chat()
+        _wait_idle(app)
+        if not isinstance(app.screen, HomeView):
+            raise TypeError(type(app.screen).__name__)
+        if i % args.sample_every == 0:
+            _sample(app, "after_leave", i)
+
+    print("phase=one_long_conversation")
+    home = app.screen
+    assert isinstance(home, HomeView)
+    home.request_new_session()
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        qt_app.processEvents()
+        if isinstance(app.screen, ChatView) and app.screen.prompt_enabled and app.bridge.is_idle():
+            break
+        time.sleep(0.01)
+    chat = app.screen
+    assert isinstance(chat, ChatView)
+    prompt = chat.prompt
+    prompt.setFocus()
+    for turn in range(args.long_turns):
+        prompt.setPlainText("greeting")
+        prompt.submitted.emit("greeting")
+        _wait_idle(app)
+        if (turn + 1) % args.sample_every == 0:
+            _sample(app, "long", turn + 1)
 
     print(
         f"summary sessions_factory_called={len(factory_calls)} "
         f"created={len(sessions_created)} "
-        f"closed={sum(1 for s in sessions_created if s.closed)} "
+        f"closed={sum(1 for session in sessions_created if session.closed)} "
         f"rss_final={_rss_mib():.1f}MiB"
     )
+    window.close()
+    app.shutdown()
 
 
 if __name__ == "__main__":
@@ -259,5 +272,4 @@ if __name__ == "__main__":
     parser.add_argument("--long-chars", type=int, default=4000, help="chars per reply in long convo")
     parser.add_argument("--sample-every", type=int, default=10)
     parser.add_argument("--work-dir", default=".kimix_cache/memory_sim")
-    args = parser.parse_args()
-    asyncio.run(main(args))
+    main(parser.parse_args())

@@ -4,9 +4,10 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import QLineEdit, QPushButton
+from qtutil import find, launch_app, wait_chat_ready, wait_home, widget_text
 from test_llm_config import write_json_config, write_llm_config
-from textual.widgets import Button, Input, Static
 
 from kimix_tui.app import KimixTuiApp
 from kimix_tui.backend import SessionOptions
@@ -15,9 +16,7 @@ from kimix_tui.llm_config import (
     inspect_llm_config,
     unavailable_config_reference,
 )
-from kimix_tui.screens.chat import ChatScreen
-from kimix_tui.screens.home import HomeScreen
-from kimix_tui.screens.settings import ConfigPathItem, LLMSettingsScreen, ProjectDefaultItem
+from kimix_tui.qt.settings_dialog import LLMSettingsDialog
 from kimix_tui.session_index import SessionSummary
 
 
@@ -37,7 +36,7 @@ class FakeSession:
         *,
         merge_wire_messages: bool = False,
     ) -> AsyncIterator[object]:
-        if False:  # pragma: no cover - keep this an async generator
+        if False:  # pragma: no cover
             yield None
 
     def cancel(self) -> None:
@@ -89,8 +88,25 @@ def config_store(tmp_path: Path) -> LLMConfigStore:
     )
 
 
-@pytest.mark.asyncio
-async def test_new_session_without_llm_shows_configuration_toast(tmp_path: Path) -> None:
+def _select_config(dialog: LLMSettingsDialog, path: Path) -> None:
+    target = path.resolve()
+    for row, item in enumerate(dialog.config_items()):
+        if item.project_default:
+            continue
+        if item.reference.path.resolve() == target:
+            dialog._list.setCurrentItem(item)
+            return
+    raise AssertionError(f"config {path} not listed")
+
+
+def _wait_settings(qtbot, app: KimixTuiApp) -> LLMSettingsDialog:
+    qtbot.waitUntil(lambda: isinstance(app.screen, LLMSettingsDialog), timeout=10_000)
+    dialog = app.screen
+    assert isinstance(dialog, LLMSettingsDialog)
+    return dialog
+
+
+def test_new_session_without_llm_shows_configuration_toast(qtbot, tmp_path: Path) -> None:
     store = config_store(tmp_path)
     store.set_default(tmp_path, unavailable_config_reference(tmp_path / "missing.json"))
     app = KimixTuiApp(
@@ -98,25 +114,18 @@ async def test_new_session_without_llm_shows_configuration_toast(tmp_path: Path)
         session_loader=session_loader,
         config_store=store,
     )
-
-    async with app.run_test(size=(110, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        home = app.screen
-        assert isinstance(home, HomeScreen)
-        assert home.query_one("#start-new-session", Button).disabled is False
-
-        await pilot.click("#start-new-session")
-        await pilot.pause()
-
-        notification = list(app._notifications)[-1]
-        assert notification.title == "LLM configuration required"
-        assert notification.message == "Select a valid LLM configuration to continue."
-        assert notification.severity == "warning"
-        assert isinstance(app.screen, LLMSettingsScreen)
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    assert find(home, "start-new-session", QPushButton).isEnabled()
+    qtbot.mouseClick(find(home, "start-new-session"), Qt.MouseButton.LeftButton)
+    _wait_settings(qtbot, app)
+    notification = list(app._notifications)[-1]
+    assert notification.title == "LLM configuration required"
+    assert notification.message == "Select a valid LLM configuration to continue."
+    assert notification.severity == "warning"
 
 
-@pytest.mark.asyncio
-async def test_session_without_config_continues_to_inherit_default(tmp_path: Path) -> None:
+def test_session_without_config_continues_to_inherit_default(qtbot, tmp_path: Path) -> None:
     first, _second = config_files(tmp_path)
     store = config_store(tmp_path)
     store.set_default(tmp_path, inspect_llm_config(first))
@@ -132,17 +141,15 @@ async def test_session_without_config_continues_to_inherit_default(tmp_path: Pat
         session_loader=session_loader,
         config_store=store,
     )
-    async with app.run_test(size=(110, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.press("enter")
-        await app.workers.wait_for_complete()
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    qtbot.keyClick(home, Qt.Key.Key_Return)
+    wait_chat_ready(qtbot, app)
+    assert opened[0].config_file == first.resolve()
+    assert store.session_for(tmp_path, "session-1") is None
 
-        assert opened[0].config_file == first.resolve()
-        assert store.session_for(tmp_path, "session-1") is None
 
-
-@pytest.mark.asyncio
-async def test_saved_session_config_overrides_startup_config(tmp_path: Path) -> None:
+def test_saved_session_config_overrides_startup_config(qtbot, tmp_path: Path) -> None:
     first, second = config_files(tmp_path)
     store = config_store(tmp_path)
     store.set_session(tmp_path, "session-1", inspect_llm_config(second))
@@ -158,17 +165,15 @@ async def test_saved_session_config_overrides_startup_config(tmp_path: Path) -> 
         session_loader=session_loader,
         config_store=store,
     )
-    async with app.run_test(size=(110, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.press("enter")
-        await app.workers.wait_for_complete()
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    qtbot.keyClick(home, Qt.Key.Key_Return)
+    wait_chat_ready(qtbot, app)
+    assert opened[0].config_file == second.resolve()
+    assert opened[0].model is None
 
-        assert opened[0].config_file == second.resolve()
-        assert opened[0].model is None
 
-
-@pytest.mark.asyncio
-async def test_home_can_configure_existing_session(tmp_path: Path) -> None:
+def test_home_can_configure_existing_session(qtbot, tmp_path: Path) -> None:
     first, second = config_files(tmp_path)
     store = config_store(tmp_path)
     store.set_default(tmp_path, inspect_llm_config(first))
@@ -178,37 +183,25 @@ async def test_home_can_configure_existing_session(tmp_path: Path) -> None:
         session_loader=session_loader,
         config_store=store,
     )
-
-    async with app.run_test(size=(110, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.click("#configure-session")
-        await pilot.pause()
-        assert isinstance(app.screen, LLMSettingsScreen)
-        assert list(app.screen.query("#config-path")) == []
-        assert list(app.screen.query("#load-config")) == []
-        assert list(app.screen.query("#delete-config")) == []
-        item = next(
-            item
-            for item in app.screen.query(ConfigPathItem)
-            if item.reference.path == second.resolve()
-        )
-        await pilot.click(item)
-        await pilot.pause()
-        assert str(app.screen.query_one("#config-model", Static).content) == "Second Model"
-        assert str(app.screen.query_one("#config-provider", Static).content) == "anthropic"
-
-        await pilot.click("#apply-settings")
-        await pilot.pause()
-
-        assert isinstance(app.screen, HomeScreen)
-        saved = store.session_for(tmp_path, "session-1")
-        assert saved is not None
-        assert saved.path == second.resolve()
-        assert str(app.screen.query_one("#detail-llm", Static).content) == "Second Model"
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    qtbot.mouseClick(find(home, "configure-session"), Qt.MouseButton.LeftButton)
+    dialog = _wait_settings(qtbot, app)
+    assert dialog.findChild(QLineEdit, "config-path") is None
+    assert dialog.findChild(QPushButton, "load-config") is None
+    assert dialog.findChild(QPushButton, "delete-config") is None
+    _select_config(dialog, second)
+    assert widget_text(dialog, "config-model") == "Second Model"
+    assert widget_text(dialog, "config-provider") == "anthropic"
+    find(dialog, "apply-settings", QPushButton).click()
+    home = wait_home(qtbot, app)
+    saved = store.session_for(tmp_path, "session-1")
+    assert saved is not None
+    assert saved.path == second.resolve()
+    assert widget_text(home, "detail-llm") == "Second Model"
 
 
-@pytest.mark.asyncio
-async def test_session_can_return_to_project_default(tmp_path: Path) -> None:
+def test_session_can_return_to_project_default(qtbot, tmp_path: Path) -> None:
     first, second = config_files(tmp_path)
     store = config_store(tmp_path)
     store.set_default(tmp_path, inspect_llm_config(first))
@@ -218,33 +211,21 @@ async def test_session_can_return_to_project_default(tmp_path: Path) -> None:
         session_loader=session_loader,
         config_store=store,
     )
-
-    async with app.run_test(size=(110, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        home = app.screen
-        assert isinstance(home, HomeScreen)
-        assert str(home.query_one("#detail-llm", Static).content) == "Second Model"
-
-        await pilot.click("#configure-session")
-        await pilot.pause()
-        settings = app.screen
-        assert isinstance(settings, LLMSettingsScreen)
-        project_default = settings.query_one(ProjectDefaultItem)
-        await pilot.click(project_default)
-        await pilot.pause()
-        assert str(settings.query_one("#config-model", Static).content) == "First Model"
-
-        await pilot.click("#apply-settings")
-        await pilot.pause()
-        home = app.screen
-        assert isinstance(home, HomeScreen)
-        assert store.session_for(tmp_path, "session-1") is None
-        assert str(home.query_one("#detail-llm", Static).content) == "First Model"
-        assert "project default" in str(home.query_one("#detail-config", Static).content)
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    assert widget_text(home, "detail-llm") == "Second Model"
+    qtbot.mouseClick(find(home, "configure-session"), Qt.MouseButton.LeftButton)
+    dialog = _wait_settings(qtbot, app)
+    dialog._list.setCurrentRow(0)
+    assert widget_text(dialog, "config-model") == "First Model"
+    find(dialog, "apply-settings", QPushButton).click()
+    home = wait_home(qtbot, app)
+    assert store.session_for(tmp_path, "session-1") is None
+    assert widget_text(home, "detail-llm") == "First Model"
+    assert "project default" in widget_text(home, "detail-config")
 
 
-@pytest.mark.asyncio
-async def test_home_default_config_applies_to_new_session(tmp_path: Path) -> None:
+def test_home_default_config_applies_to_new_session(qtbot, tmp_path: Path) -> None:
     first, second = config_files(tmp_path)
     store = config_store(tmp_path)
     store.set_default(tmp_path, inspect_llm_config(first))
@@ -260,33 +241,28 @@ async def test_home_default_config_applies_to_new_session(tmp_path: Path) -> Non
         session_loader=session_loader,
         config_store=store,
     )
-    async with app.run_test(size=(110, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.click("#open-settings")
-        await pilot.pause()
-        assert isinstance(app.screen, LLMSettingsScreen)
-        app.screen.query_one("#config-path", Input).value = str(second)
-        await pilot.click("#load-config")
-        await pilot.click("#apply-settings")
-        await pilot.pause()
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    qtbot.mouseClick(find(home, "open-settings"), Qt.MouseButton.LeftButton)
+    dialog = _wait_settings(qtbot, app)
+    find(dialog, "config-path", QLineEdit).setText(str(second))
+    find(dialog, "load-config", QPushButton).click()
+    find(dialog, "apply-settings", QPushButton).click()
+    home = wait_home(qtbot, app)
+    assert widget_text(home, "home-model").endswith("Second Model")
+    saved_default = store.default_for(tmp_path)
+    assert saved_default is not None
+    assert saved_default.path == second.resolve()
 
-        assert isinstance(app.screen, HomeScreen)
-        assert str(app.screen.query_one("#home-model", Static).content).endswith("Second Model")
-        saved_default = store.default_for(tmp_path)
-        assert saved_default is not None
-        assert saved_default.path == second.resolve()
-
-        await pilot.press("n")
-        await app.workers.wait_for_complete()
-
-        assert opened[0].config_file == second.resolve()
-        saved_session = store.session_for(tmp_path, "new-session")
-        assert saved_session is not None
-        assert saved_session.path == second.resolve()
+    qtbot.keyClick(home, Qt.Key.Key_N)
+    wait_chat_ready(qtbot, app)
+    assert opened[0].config_file == second.resolve()
+    saved_session = store.session_for(tmp_path, "new-session")
+    assert saved_session is not None
+    assert saved_session.path == second.resolve()
 
 
-@pytest.mark.asyncio
-async def test_add_config_does_not_change_project_default(tmp_path: Path) -> None:
+def test_add_config_does_not_change_project_default(qtbot, tmp_path: Path) -> None:
     first, second = config_files(tmp_path)
     store = config_store(tmp_path)
     store.set_default(tmp_path, inspect_llm_config(first))
@@ -295,27 +271,24 @@ async def test_add_config_does_not_change_project_default(tmp_path: Path) -> Non
         session_loader=session_loader,
         config_store=store,
     )
-
-    async with app.run_test(size=(110, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.click("#open-settings")
-        await pilot.pause()
-        app.screen.query_one("#config-path", Input).value = str(second)
-        await pilot.click("#load-config")
-        await pilot.click("#cancel-settings")
-        await pilot.pause()
-
-        saved_default = store.default_for(tmp_path)
-        assert saved_default is not None
-        assert saved_default.path == first.resolve()
-        assert {reference.path for reference in store.configs()} == {
-            first.resolve(),
-            second.resolve(),
-        }
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    qtbot.mouseClick(find(home, "open-settings"), Qt.MouseButton.LeftButton)
+    dialog = _wait_settings(qtbot, app)
+    find(dialog, "config-path", QLineEdit).setText(str(second))
+    find(dialog, "load-config", QPushButton).click()
+    find(dialog, "cancel-settings", QPushButton).click()
+    wait_home(qtbot, app)
+    saved_default = store.default_for(tmp_path)
+    assert saved_default is not None
+    assert saved_default.path == first.resolve()
+    assert {reference.path for reference in store.configs()} == {
+        first.resolve(),
+        second.resolve(),
+    }
 
 
-@pytest.mark.asyncio
-async def test_project_settings_can_remove_non_default_config(tmp_path: Path) -> None:
+def test_project_settings_can_remove_non_default_config(qtbot, tmp_path: Path) -> None:
     first, second = config_files(tmp_path)
     store = config_store(tmp_path)
     store.set_default(tmp_path, inspect_llm_config(first))
@@ -325,35 +298,24 @@ async def test_project_settings_can_remove_non_default_config(tmp_path: Path) ->
         session_loader=session_loader,
         config_store=store,
     )
-
-    async with app.run_test(size=(110, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.click("#open-settings")
-        await pilot.pause()
-        settings = app.screen
-        assert isinstance(settings, LLMSettingsScreen)
-        assert settings.query_one("#delete-config", Button).disabled is True
-        second_item = next(
-            item
-            for item in settings.query(ConfigPathItem)
-            if item.reference.path == second.resolve()
-        )
-        await pilot.click(second_item)
-        await pilot.pause()
-        assert settings.query_one("#delete-config", Button).disabled is False
-
-        await pilot.click("#delete-config")
-        await pilot.pause()
-
-        assert {reference.path for reference in store.configs()} == {first.resolve()}
-        assert all(
-            item.reference.path != second.resolve() for item in settings.query(ConfigPathItem)
-        )
-        assert settings.query_one("#delete-config", Button).disabled is True
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    qtbot.mouseClick(find(home, "open-settings"), Qt.MouseButton.LeftButton)
+    dialog = _wait_settings(qtbot, app)
+    assert find(dialog, "delete-config", QPushButton).isEnabled() is False
+    _select_config(dialog, second)
+    assert find(dialog, "delete-config", QPushButton).isEnabled()
+    find(dialog, "delete-config", QPushButton).click()
+    assert {reference.path for reference in store.configs()} == {first.resolve()}
+    assert all(
+        item.reference.path.resolve() != second.resolve()
+        for item in dialog.config_items()
+        if not item.project_default
+    )
+    assert find(dialog, "delete-config", QPushButton).isEnabled() is False
 
 
-@pytest.mark.asyncio
-async def test_missing_session_config_requires_reconfiguration(tmp_path: Path) -> None:
+def test_missing_session_config_requires_reconfiguration(qtbot, tmp_path: Path) -> None:
     first, _second = config_files(tmp_path)
     store = config_store(tmp_path)
     store.set_default(tmp_path, inspect_llm_config(first))
@@ -367,26 +329,19 @@ async def test_missing_session_config_requires_reconfiguration(tmp_path: Path) -
         session_loader=session_loader,
         config_store=store,
     )
-
-    async with app.run_test(size=(110, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        home = app.screen
-        assert isinstance(home, HomeScreen)
-        assert home.query_one("#open-session", Button).disabled is False
-        assert "missing" in str(home.query_one("#detail-config", Static).content)
-
-        await pilot.click("#open-session")
-        await pilot.pause()
-
-        notification = list(app._notifications)[-1]
-        assert notification.title == "LLM configuration required"
-        assert notification.message == "Select a valid LLM configuration to continue."
-        assert notification.severity == "warning"
-        assert isinstance(app.screen, LLMSettingsScreen)
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    assert find(home, "open-session", QPushButton).isEnabled()
+    assert "missing" in widget_text(home, "detail-config")
+    qtbot.mouseClick(find(home, "open-session"), Qt.MouseButton.LeftButton)
+    _wait_settings(qtbot, app)
+    notification = list(app._notifications)[-1]
+    assert notification.title == "LLM configuration required"
+    assert notification.message == "Select a valid LLM configuration to continue."
+    assert notification.severity == "warning"
 
 
-@pytest.mark.asyncio
-async def test_deleted_session_config_keeps_path_until_reconfigured(tmp_path: Path) -> None:
+def test_deleted_session_config_keeps_path_until_reconfigured(qtbot, tmp_path: Path) -> None:
     first, second = config_files(tmp_path)
     reference = inspect_llm_config(first)
     store = config_store(tmp_path)
@@ -405,41 +360,30 @@ async def test_deleted_session_config_keeps_path_until_reconfigured(tmp_path: Pa
         session_loader=session_loader,
         config_store=store,
     )
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    assert widget_text(home, "detail-llm") == "Configuration unavailable"
+    assert widget_text(home, "detail-provider") == "Unavailable"
+    assert str(first.resolve()) in widget_text(home, "detail-config")
+    assert find(home, "open-session", QPushButton).isEnabled()
 
-    async with app.run_test(size=(110, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        home = app.screen
-        assert isinstance(home, HomeScreen)
-        assert str(home.query_one("#detail-llm", Static).content) == "Configuration unavailable"
-        assert str(home.query_one("#detail-provider", Static).content) == "Unavailable"
-        assert str(first.resolve()) in str(home.query_one("#detail-config", Static).content)
-        assert home.query_one("#open-session", Button).disabled is False
+    qtbot.keyClick(home, Qt.Key.Key_Return)
+    dialog = _wait_settings(qtbot, app)
+    assert widget_text(dialog, "config-model") == "Configuration unavailable"
+    assert "does not exist" in widget_text(dialog, "settings-error")
+    assert find(dialog, "apply-settings", QPushButton).isEnabled() is False
 
-        await pilot.press("enter")
-        await pilot.pause()
-        assert isinstance(app.screen, LLMSettingsScreen)
-        assert str(app.screen.query_one("#config-model", Static).content) == "Configuration unavailable"
-        assert "does not exist" in str(app.screen.query_one("#settings-error", Static).content)
-        assert app.screen.query_one("#apply-settings", Button).disabled is True
+    _select_config(dialog, second)
+    find(dialog, "apply-settings", QPushButton).click()
+    home = wait_home(qtbot, app)
+    assert find(home, "open-session", QPushButton).isEnabled()
 
-        item = next(
-            item
-            for item in app.screen.query(ConfigPathItem)
-            if item.reference.path == second.resolve()
-        )
-        await pilot.click(item)
-        await pilot.click("#apply-settings")
-        await pilot.pause()
-        assert isinstance(app.screen, HomeScreen)
-        assert app.screen.query_one("#open-session", Button).disabled is False
-
-        await pilot.press("enter")
-        await app.workers.wait_for_complete()
-        assert opened[0].config_file == second.resolve()
+    qtbot.keyClick(home, Qt.Key.Key_Return)
+    wait_chat_ready(qtbot, app)
+    assert opened[0].config_file == second.resolve()
 
 
-@pytest.mark.asyncio
-async def test_direct_resume_with_missing_config_opens_settings(tmp_path: Path) -> None:
+def test_direct_resume_with_missing_config_opens_settings(qtbot, tmp_path: Path) -> None:
     first, second = config_files(tmp_path)
     store = config_store(tmp_path)
     store.set_default(tmp_path, inspect_llm_config(second))
@@ -457,17 +401,12 @@ async def test_direct_resume_with_missing_config_opens_settings(tmp_path: Path) 
         session_loader=session_loader,
         config_store=store,
     )
-
-    async with app.run_test(size=(110, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-
-        assert isinstance(app.screen, LLMSettingsScreen)
-        assert opened == []
+    launch_app(qtbot, app)
+    _wait_settings(qtbot, app)
+    assert opened == []
 
 
-@pytest.mark.asyncio
-async def test_settings_stacks_library_and_details_on_narrow_terminal(tmp_path: Path) -> None:
+def test_settings_stacks_library_and_details_on_narrow_window(qtbot, tmp_path: Path) -> None:
     first, _second = config_files(tmp_path)
     store = config_store(tmp_path)
     store.set_default(tmp_path, inspect_llm_config(first))
@@ -476,26 +415,21 @@ async def test_settings_stacks_library_and_details_on_narrow_terminal(tmp_path: 
         session_loader=session_loader,
         config_store=store,
     )
-
-    async with app.run_test(size=(70, 24)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.click("#open-settings")
-        await pilot.pause()
-        settings = app.screen
-        assert isinstance(settings, LLMSettingsScreen)
-        sources = settings.query_one("#config-sources")
-        details = settings.query_one("#config-details")
-        dialog = settings.query_one("#settings-dialog")
-
-        assert settings.has_class("-narrow")
-        assert details.region.y > sources.region.y
-        assert settings.query_one("#settings-actions").region.bottom <= dialog.region.bottom
-        assert settings.query_one("#delete-config", Button).region.x >= dialog.region.x
-        assert settings.query_one("#apply-settings", Button).region.right <= dialog.region.right
+    launch_app(qtbot, app, size=(700, 560))
+    home = wait_home(qtbot, app)
+    qtbot.mouseClick(find(home, "open-settings"), Qt.MouseButton.LeftButton)
+    dialog = _wait_settings(qtbot, app)
+    dialog.resize(700, 560)
+    qtbot.waitUntil(lambda: dialog._splitter.orientation() == Qt.Orientation.Vertical, timeout=5_000)
+    sources = find(dialog, "config-sources")
+    details = find(dialog, "config-details")
+    assert details.y() > sources.y()
+    assert find(dialog, "settings-actions").geometry().bottom() <= dialog.rect().bottom()
+    assert find(dialog, "delete-config").x() >= 0
+    assert find(dialog, "apply-settings").geometry().right() <= dialog.width()
 
 
-@pytest.mark.asyncio
-async def test_home_refreshes_changed_external_config(tmp_path: Path) -> None:
+def test_home_refreshes_changed_external_config(qtbot, tmp_path: Path) -> None:
     first, _second = config_files(tmp_path)
     store = config_store(tmp_path)
     store.set_session(tmp_path, "session-1", inspect_llm_config(first))
@@ -511,17 +445,13 @@ async def test_home_refreshes_changed_external_config(tmp_path: Path) -> None:
         session_loader=session_loader,
         config_store=store,
     )
-
-    async with app.run_test(size=(110, 35)):
-        await app.workers.wait_for_complete()
-        home = app.screen
-        assert isinstance(home, HomeScreen)
-        assert str(home.query_one("#detail-llm", Static).content) == "Changed Model"
-        assert str(home.query_one("#detail-provider", Static).content) == "google_genai"
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    assert widget_text(home, "detail-llm") == "Changed Model"
+    assert widget_text(home, "detail-provider") == "google_genai"
 
 
-@pytest.mark.asyncio
-async def test_settings_applies_external_json_config(tmp_path: Path) -> None:
+def test_settings_applies_external_json_config(qtbot, tmp_path: Path) -> None:
     first, _second = config_files(tmp_path)
     json_config = write_json_config(
         tmp_path / "external.json",
@@ -536,33 +466,22 @@ async def test_settings_applies_external_json_config(tmp_path: Path) -> None:
         session_loader=session_loader,
         config_store=store,
     )
-
-    async with app.run_test(size=(110, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.click("#configure-session")
-        await pilot.pause()
-        assert isinstance(app.screen, LLMSettingsScreen)
-        item = next(
-            item
-            for item in app.screen.query(ConfigPathItem)
-            if item.reference.path == json_config.resolve()
-        )
-        await pilot.click(item)
-        await pilot.pause()
-
-        assert str(app.screen.query_one("#config-format", Static).content) == "JSON"
-        assert str(app.screen.query_one("#config-model", Static).content) == "Claude JSON"
-        await pilot.click("#apply-settings")
-        await pilot.pause()
-
-        saved = store.session_for(tmp_path, "session-1")
-        assert saved is not None
-        assert saved.path == json_config.resolve()
-        assert saved.file_format == "JSON"
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    qtbot.mouseClick(find(home, "configure-session"), Qt.MouseButton.LeftButton)
+    dialog = _wait_settings(qtbot, app)
+    _select_config(dialog, json_config)
+    assert widget_text(dialog, "config-format") == "JSON"
+    assert widget_text(dialog, "config-model") == "Claude JSON"
+    find(dialog, "apply-settings", QPushButton).click()
+    wait_home(qtbot, app)
+    saved = store.session_for(tmp_path, "session-1")
+    assert saved is not None
+    assert saved.path == json_config.resolve()
+    assert saved.file_format == "JSON"
 
 
-@pytest.mark.asyncio
-async def test_chat_config_change_is_delayed_until_next_resume(tmp_path: Path) -> None:
+def test_chat_config_change_is_delayed_until_next_resume(qtbot, tmp_path: Path) -> None:
     first, second = config_files(tmp_path)
     store = config_store(tmp_path)
     store.set_session(tmp_path, "session-1", inspect_llm_config(first))
@@ -579,36 +498,25 @@ async def test_chat_config_change_is_delayed_until_next_resume(tmp_path: Path) -
         session_loader=session_loader,
         config_store=store,
     )
-    async with app.run_test(size=(110, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.press("enter")
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        assert opened[0].config_file == first.resolve()
+    window = launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    qtbot.keyClick(home, Qt.Key.Key_Return)
+    chat = wait_chat_ready(qtbot, app)
+    assert opened[0].config_file == first.resolve()
 
-        await pilot.press("f4")
-        await pilot.pause()
-        assert isinstance(app.screen, LLMSettingsScreen)
-        item = next(
-            item
-            for item in app.screen.query(ConfigPathItem)
-            if item.reference.path == second.resolve()
-        )
-        await pilot.click(item)
-        await pilot.click("#apply-settings")
-        await pilot.pause()
+    qtbot.keyClick(window, Qt.Key.Key_F4)
+    dialog = _wait_settings(qtbot, app)
+    _select_config(dialog, second)
+    find(dialog, "apply-settings", QPushButton).click()
+    qtbot.waitUntil(lambda: app.screen is chat, timeout=10_000)
+    assert len(opened) == 1
+    assert "next: Second Model" in widget_text(chat, "status")
+    saved = store.session_for(tmp_path, "session-1")
+    assert saved is not None
+    assert saved.path == second.resolve()
 
-        assert app.screen is chat
-        assert len(opened) == 1
-        assert "next: Second Model" in str(chat.query_one("#status", Static).content)
-        saved = store.session_for(tmp_path, "session-1")
-        assert saved is not None
-        assert saved.path == second.resolve()
-
-        await pilot.press("escape")
-        await app.workers.wait_for_complete()
-        await pilot.press("enter")
-        await app.workers.wait_for_complete()
-
-        assert opened[1].config_file == second.resolve()
+    qtbot.keyClick(window, Qt.Key.Key_Escape)
+    home = wait_home(qtbot, app)
+    qtbot.keyClick(home, Qt.Key.Key_Return)
+    wait_chat_ready(qtbot, app)
+    assert opened[1].config_file == second.resolve()

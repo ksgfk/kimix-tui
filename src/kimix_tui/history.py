@@ -16,7 +16,7 @@ from kimix_tui.rendering import (
     render_wire_message,
     user_input_text,
 )
-from kimix_tui.transcript_paint import default_expanded, is_compact_record, is_dialogue_record
+from kimix_tui.transcript_layout import default_expanded, is_compact_record, is_dialogue_record
 
 # Legacy paging caps. Chat no longer windows history with these; they remain
 # for the memory-diagnosis script and injected HistoryLoader tests.

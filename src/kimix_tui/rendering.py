@@ -51,7 +51,7 @@ RenderKind = Literal[
 
 @dataclass(frozen=True, slots=True)
 class RenderEvent:
-    """A framework-neutral display event consumed by the Textual layer."""
+    """A framework-neutral display event consumed by the Qt UI layer."""
 
     kind: RenderKind
     text: str

@@ -11,7 +11,7 @@ from kimix_tui.backend import SessionOptions
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Keyboard-first TUI for Kimix")
+    parser = argparse.ArgumentParser(description="Keyboard-first PySide6 client for Kimix")
     parser.add_argument(
         "--work-dir",
         type=Path,

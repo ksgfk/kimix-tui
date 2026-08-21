@@ -1,6 +1,6 @@
 # kimix-tui
 
-一个独立、纯 Python 的 Kimix TUI。聊天循环通过 Kimix 公开的异步
+一个独立、纯 Python 的 Kimix 桌面客户端。聊天循环通过 Kimix 公开的异步
 Worker 会话工厂创建与恢复会话；启动时的历史会话列表按 kimi-cli 的
 工作目录存储规则扫描。
 
@@ -62,15 +62,15 @@ uv run kimix-tui --config=C:\path\to\provider.json
 
 配置优先级为 session 配置高于 work dir 默认配置。工程 Settings 可以添加或移除配置库引用，但不能移除正在使用的工程默认；移除引用不会删除 provider JSON 文件。配置单个 session 时只能从现有配置中选择，也可以选择 **Project default**；session Settings 不提供添加或删除操作。选择工程默认会删除该 session 的独立配置引用，使它持续跟随工程默认。全局 `KIMI_SHARE_DIR/kimix-tui.json`（默认 `~/.kimi/kimix-tui.json`）只保存配置文件绝对路径列表和各 work dir 的默认路径；每个 session 的配置路径保存在 Kimi session 目录自己的 `kimix-tui.json`。这些引用文件不保存模型摘要、Provider 参数或 API Key。若引用的 provider JSON 丢失，界面显示其路径和 Missing，禁止进入并要求先重新配置。
 
-建议在 Windows Terminal 中运行。主页支持鼠标预览和打开会话。
+建议以桌面窗口运行。主页支持鼠标预览和打开会话。
 
-## Textual 结构
+## 窗口结构
 
-- `KimixTuiApp` 只负责在顶层 Screen 之间路由
-- `HomeScreen` 和 `ChatScreen` 是完整页面
-- `LLMSettingsScreen`、`ApprovalScreen` 和 `QuestionScreen` 是阻塞当前页面的 `ModalScreen`
-- 所有 Screen 位于 `kimix_tui/screens/`，App 只保留路由和跨 Screen 状态
-- 页面内部使用 Textual 的 `Widget` 和 `Container` 组合，不定义额外的 window/panel 层级
+- `KimixTuiApp` 只负责在 Home / Chat 之间路由，并拥有 LLM 配置与 Kimix worker 线程
+- `HomeView` 和 `ChatView` 是主窗口里的完整页面（`QStackedWidget`）
+- `LLMSettingsDialog`、`ApprovalDialog` 和 `QuestionDialog` 是不阻塞 GUI 线程的模态对话框（`open()`，不用 `exec()`）
+- 页面位于 `kimix_tui/qt/`；`KimixBridge` 在独立线程跑 asyncio，SDK 对象不进入 GUI 线程
+- 聊天记录由虚拟化的 `QListView` 绘制，历史按 Timeline 滑窗替换
 
 ## 快捷键
 

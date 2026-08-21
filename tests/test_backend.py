@@ -106,6 +106,10 @@ async def test_session_factory_resumes_through_kimix_worker_factory(
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    not (Path(__file__).resolve().parents[1] / "vendor" / "KimiX" / "pyproject.toml").exists(),
+    reason="vendor/KimiX submodule is not checked out",
+)
 async def test_session_factory_loads_worker_execution_tools(tmp_path: Path) -> None:
     config_file = tmp_path / "config.json"
     config_file.write_text(

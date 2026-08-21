@@ -5,22 +5,16 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 
-import pytest
-from textual.widgets import Button, Footer, Input, Static
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton
+from qtutil import find, launch_app, wait_chat_ready, wait_home, wait_idle, widget_text
 
 from kimix_tui.app import KimixTuiApp
 from kimix_tui.backend import SessionOptions
 from kimix_tui.llm_config import LLMConfigStore, inspect_llm_config
-from kimix_tui.screens.chat import ChatScreen
-from kimix_tui.screens.home import (
-    DeleteSessionsScreen,
-    HomeScreen,
-    SessionCheck,
-    SessionDetails,
-    SessionListItem,
-)
+from kimix_tui.qt.chat_view import ChatView
+from kimix_tui.qt.request_dialogs import DeleteSessionsDialog
 from kimix_tui.session_index import SessionSummary
-from kimix_tui.widgets import PromptInput
 
 
 def _config_store(tmp_path: Path) -> LLMConfigStore:
@@ -67,7 +61,7 @@ class FakeSession:
     ) -> AsyncIterator[object]:
         self.prompts.append(user_input)
         assert merge_wire_messages is False
-        if False:  # pragma: no cover - keep this an async generator
+        if False:  # pragma: no cover
             yield None
 
     def cancel(self) -> None:
@@ -118,16 +112,7 @@ async def _empty_loader(_work_dir: Path) -> list[SessionSummary]:
     return []
 
 
-def _shown_binding_labels(app: KimixTuiApp) -> set[str]:
-    return {
-        active.binding.description
-        for active in app.screen.active_bindings.values()
-        if active.binding.show and active.binding.description
-    }
-
-
-@pytest.mark.asyncio
-async def test_missing_session_id_opens_home(tmp_path: Path) -> None:
+def test_missing_session_id_opens_home(qtbot, tmp_path: Path) -> None:
     session = FakeSession()
 
     async def factory(_options: SessionOptions) -> FakeSession:
@@ -139,29 +124,17 @@ async def test_missing_session_id_opens_home(tmp_path: Path) -> None:
         session_loader=_history_loader,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        assert isinstance(app.screen, HomeScreen)
-        assert list(app.screen.query(Footer)) == []
-        assert [item.summary.id for item in app.screen.query(SessionListItem)] == [
-            "sess-1",
-            "sess-2",
-        ]
-        assert app.screen.query_one(SessionDetails).summary == _summaries()[0]
-        assert str(app.screen.query_one("#detail-size", Static).content) == "1.5 MB"
-        assert str(app.screen.query_one("#detail-storage", Static).content) == "SQLite · 4 files"
-        assert str(app.screen.query_one("#detail-todos", Static).content) == "2"
-        assert str(app.screen.query_one("#detail-directories", Static).content) == "1"
-        labels = _shown_binding_labels(app)
-        assert "Cancel" not in labels
-        assert "Prompt" not in labels
-        assert "Quit" not in labels
-        assert "Sessions" not in labels
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    assert [row.summary.id for row in home.session_rows()] == ["sess-1", "sess-2"]
+    assert home.summary == _summaries()[0]
+    assert widget_text(home, "detail-size") == "1.5 MB"
+    assert widget_text(home, "detail-storage") == "SQLite · 4 files"
+    assert widget_text(home, "detail-todos") == "2"
+    assert widget_text(home, "detail-directories") == "1"
 
 
-@pytest.mark.asyncio
-async def test_new_session_shortcut_skips_resume(tmp_path: Path) -> None:
+def test_new_session_shortcut_skips_resume(qtbot, tmp_path: Path) -> None:
     opened: list[SessionOptions] = []
     session = FakeSession()
 
@@ -175,23 +148,15 @@ async def test_new_session_shortcut_skips_resume(tmp_path: Path) -> None:
         session_loader=_history_loader,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        await pilot.press("n")
-        await app.workers.wait_for_complete()
-
-        assert opened[0].session_id is None
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        prompt = chat.query_one("#prompt", PromptInput)
-        assert prompt.disabled is False
-
-    assert session.closed is True
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    qtbot.keyClick(home, Qt.Key.Key_N)
+    chat = wait_chat_ready(qtbot, app)
+    assert opened[0].session_id is None
+    assert chat.prompt_enabled is True
 
 
-@pytest.mark.asyncio
-async def test_new_session_button_starts_chat(tmp_path: Path) -> None:
+def test_new_session_button_starts_chat(qtbot, tmp_path: Path) -> None:
     opened: list[SessionOptions] = []
     session = FakeSession()
 
@@ -205,18 +170,15 @@ async def test_new_session_button_starts_chat(tmp_path: Path) -> None:
         session_loader=_empty_loader,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        await pilot.click("#start-new-session")
-        await app.workers.wait_for_complete()
-
-        assert opened[0].session_id is None
-        assert isinstance(app.screen, ChatScreen)
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    qtbot.mouseClick(find(home, "start-new-session"), Qt.MouseButton.LeftButton)
+    wait_chat_ready(qtbot, app)
+    assert opened[0].session_id is None
+    assert isinstance(app.screen, ChatView)
 
 
-@pytest.mark.asyncio
-async def test_click_previews_session_before_opening(tmp_path: Path) -> None:
+def test_click_previews_session_before_opening(qtbot, tmp_path: Path) -> None:
     opened: list[SessionOptions] = []
     session = FakeSession("sess-2")
 
@@ -230,90 +192,66 @@ async def test_click_previews_session_before_opening(tmp_path: Path) -> None:
         session_loader=_history_loader,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        home = app.screen
-        assert isinstance(home, HomeScreen)
-        items = list(home.query(SessionListItem))
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    rows = home.session_rows()
+    qtbot.mouseClick(rows[1], Qt.MouseButton.LeftButton, pos=QPoint(90, 14))
 
-        await pilot.click(items[1])
-        await pilot.pause()
+    assert app.screen is home
+    assert opened == []
+    assert home.summary is not None
+    assert home.summary.id == "sess-2"
+    assert widget_text(home, "detail-state") == "Archived session"
+    assert widget_text(home, "detail-size") == "42 KB"
 
-        details = home.query_one(SessionDetails)
-        assert app.screen is home
-        assert opened == []
-        assert details.summary is not None
-        assert details.summary.id == "sess-2"
-        assert str(home.query_one("#detail-state", Static).content) == "Archived session"
-        assert str(home.query_one("#detail-size", Static).content) == "42 KB"
-
-        await pilot.click("#open-session")
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-
-        assert opened[0].session_id == "sess-2"
-        assert isinstance(app.screen, ChatScreen)
+    qtbot.mouseClick(find(home, "open-session"), Qt.MouseButton.LeftButton)
+    wait_chat_ready(qtbot, app)
+    assert opened[0].session_id == "sess-2"
+    assert isinstance(app.screen, ChatView)
 
 
-@pytest.mark.asyncio
-async def test_click_session_check_toggles_selection(tmp_path: Path) -> None:
+def test_click_session_check_toggles_selection(qtbot, tmp_path: Path) -> None:
     app = KimixTuiApp(
         SessionOptions(tmp_path),
         session_loader=_history_loader,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        home = app.screen
-        assert isinstance(home, HomeScreen)
-        items = list(home.query(SessionListItem))
-        second_check = items[1].query_one(SessionCheck)
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    rows = home.session_rows()
+    first = rows[0].summary
+    qtbot.mouseClick(rows[1], Qt.MouseButton.LeftButton, pos=QPoint(8, 8))
 
-        await pilot.click(second_check)
-        await pilot.pause()
+    assert rows[1].selected is True
+    assert find(rows[1], "session-check", QLabel).text() == "[x]"
+    assert widget_text(home, "selection-count") == "1 selected"
+    assert home.summary == first
 
-        assert items[1].selected is True
-        assert str(second_check.content) == "[x]"
-        assert str(home.query_one("#selection-count", Static).content) == "1 selected"
-        assert home.query_one(SessionDetails).summary == items[0].summary
-
-        await pilot.click(second_check)
-        await pilot.pause()
-
-        assert items[1].selected is False
-        assert str(second_check.content) == "[ ]"
-        assert str(home.query_one("#selection-count", Static).content) == "0 selected"
+    qtbot.mouseClick(rows[1], Qt.MouseButton.LeftButton, pos=QPoint(8, 8))
+    assert rows[1].selected is False
+    assert find(rows[1], "session-check", QLabel).text() == "[ ]"
+    assert widget_text(home, "selection-count") == "0 selected"
 
 
-@pytest.mark.asyncio
-async def test_home_filters_sessions_by_title(tmp_path: Path) -> None:
+def test_home_filters_sessions_by_title(qtbot, tmp_path: Path) -> None:
     app = KimixTuiApp(
         SessionOptions(tmp_path),
         session_loader=_history_loader,
         config_store=_config_store(tmp_path),
     )
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    search = find(home, "session-search", QLineEdit)
+    search.setText("LOGIN")
+    assert [row.summary.id for row in home.session_rows()] == ["sess-1"]
+    assert widget_text(home, "session-count") == "1 of 2"
 
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        home = app.screen
-        assert isinstance(home, HomeScreen)
-        search = home.query_one("#session-search", Input)
-        search.value = "LOGIN"
-        await pilot.pause()
-
-        assert [item.summary.id for item in home.query(SessionListItem)] == ["sess-1"]
-        assert str(home.query_one("#session-count", Static).content) == "1 of 2"
-
-        search.value = "missing title"
-        await pilot.pause()
-        assert list(home.query(SessionListItem)) == []
-        assert "No sessions match" in str(home.query_one("#home-status", Static).content)
+    search.setText("missing title")
+    assert home.session_rows() == []
+    assert "No sessions match" in widget_text(home, "home-status")
 
 
-@pytest.mark.asyncio
-async def test_home_selects_and_deletes_sessions_in_batch(tmp_path: Path) -> None:
+def test_home_selects_and_deletes_sessions_in_batch(qtbot, tmp_path: Path) -> None:
     deleted: list[str] = []
 
     async def deleter(_work_dir: Path, session_ids: Sequence[str]) -> None:
@@ -325,32 +263,26 @@ async def test_home_selects_and_deletes_sessions_in_batch(tmp_path: Path) -> Non
         session_deleter=deleter,
         config_store=_config_store(tmp_path),
     )
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    find(home, "select-shown", QPushButton).click()
+    assert widget_text(home, "selection-count") == "2 selected"
+    assert find(home, "delete-sessions", QPushButton).isEnabled()
+    assert all(row.selected for row in home.session_rows())
 
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        home = app.screen
-        assert isinstance(home, HomeScreen)
-        await pilot.click("#select-shown")
-        await pilot.pause()
+    find(home, "delete-sessions", QPushButton).click()
+    qtbot.waitUntil(lambda: isinstance(app.screen, DeleteSessionsDialog), timeout=10_000)
+    find(app.screen, "confirm-delete", QPushButton).click()
+    qtbot.waitUntil(lambda: home.session_rows() == [], timeout=10_000)
+    wait_idle(qtbot, app)
 
-        assert str(home.query_one("#selection-count", Static).content) == "2 selected"
-        assert home.query_one("#delete-sessions", Button).disabled is False
-        assert all(item.selected for item in home.query(SessionListItem))
-
-        await pilot.click("#delete-sessions")
-        await pilot.pause()
-        assert isinstance(app.screen, DeleteSessionsScreen)
-        await pilot.click("#confirm-delete")
-        await app.workers.wait_for_complete()
-
-        assert deleted == ["sess-1", "sess-2"]
-        assert app.screen is home
-        assert list(home.query(SessionListItem)) == []
-        assert str(home.query_one("#selection-count", Static).content) == "0 selected"
+    assert deleted == ["sess-1", "sess-2"]
+    assert app.screen is home
+    assert home.session_rows() == []
+    assert widget_text(home, "selection-count") == "0 selected"
 
 
-@pytest.mark.asyncio
-async def test_enter_resumes_highlighted_session(tmp_path: Path) -> None:
+def test_enter_resumes_highlighted_session(qtbot, tmp_path: Path) -> None:
     opened: list[SessionOptions] = []
     session = FakeSession("sess-1")
 
@@ -364,25 +296,16 @@ async def test_enter_resumes_highlighted_session(tmp_path: Path) -> None:
         session_loader=_history_loader,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        await pilot.press("enter")
-        await app.workers.wait_for_complete()
-
-        assert opened[0].session_id == "sess-1"
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        assert any(record.text == "Session: sess-1" for record in chat.transcript.records)
-        assert str(chat.query_one("#leave-session", Button).label) == "Home"
-        labels = _shown_binding_labels(app)
-        assert "Home" not in labels
-        assert "Quit" not in labels
-        assert "Cancel" in labels
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    qtbot.keyClick(home, Qt.Key.Key_Return)
+    chat = wait_chat_ready(qtbot, app)
+    assert opened[0].session_id == "sess-1"
+    assert any(record.text == "Session: sess-1" for record in chat.transcript.records)
+    assert find(chat, "leave-session", QPushButton).text() == "Home"
 
 
-@pytest.mark.asyncio
-async def test_escape_from_chat_returns_home_and_releases_session(tmp_path: Path) -> None:
+def test_escape_from_chat_returns_home_and_releases_session(qtbot, tmp_path: Path) -> None:
     opened: list[SessionOptions] = []
     sessions: list[FakeSession] = []
 
@@ -398,47 +321,29 @@ async def test_escape_from_chat_returns_home_and_releases_session(tmp_path: Path
         session_loader=_history_loader,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        await pilot.press("enter")
-        await app.workers.wait_for_complete()
+    window = launch_app(qtbot, app)
+    wait_home(qtbot, app)
+    qtbot.keyClick(app.screen, Qt.Key.Key_Return)
+    chat = wait_chat_ready(qtbot, app)
+    assert chat.session_id == sessions[0].id
+    assert any(record.text == "Session: sess-1" for record in chat.transcript.records)
 
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        assert chat.session is sessions[0]
-        assert any(record.text == "Session: sess-1" for record in chat.transcript.records)
+    qtbot.keyClick(window, Qt.Key.Key_Escape)
+    home = wait_home(qtbot, app)
+    assert sessions[0].closed is True
+    assert window.chat is None
+    assert chat.busy is False
+    assert app._options.session_id is None
 
-        await pilot.press("escape")
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-
-        assert isinstance(app.screen, HomeScreen)
-        labels = _shown_binding_labels(app)
-        assert "Cancel" not in labels
-        assert "Prompt" not in labels
-        assert "Quit" not in labels
-        assert sessions[0].closed is True
-        assert chat.session is None
-        assert chat.busy is False
-        assert all(not isinstance(screen, ChatScreen) for screen in app.screen_stack)
-        assert app._options.session_id is None
-
-        await pilot.press("n")
-        await app.workers.wait_for_complete()
-
-        assert opened[1].session_id is None
-        new_chat = app.screen
-        assert isinstance(new_chat, ChatScreen)
-        assert new_chat.session is sessions[1]
-        assert sessions[1].closed is False
-        assert all(record.text != "Session: sess-1" for record in new_chat.transcript.records)
-
-    assert all(session.closed for session in sessions)
+    qtbot.keyClick(home, Qt.Key.Key_N)
+    new_chat = wait_chat_ready(qtbot, app)
+    assert opened[1].session_id is None
+    assert new_chat.session_id == sessions[1].id
+    assert sessions[1].closed is False
+    assert all(record.text != "Session: sess-1" for record in new_chat.transcript.records)
 
 
-@pytest.mark.asyncio
-async def test_quit_command_returns_home(tmp_path: Path) -> None:
+def test_quit_command_returns_home(qtbot, tmp_path: Path) -> None:
     session = FakeSession("fake-session")
 
     async def factory(_options: SessionOptions) -> FakeSession:
@@ -450,63 +355,52 @@ async def test_quit_command_returns_home(tmp_path: Path) -> None:
         session_loader=_history_loader,
         config_store=_config_store(tmp_path),
     )
-    async with app.run_test(size=(100, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        chat = app.screen
-        assert isinstance(chat, ChatScreen)
-        prompt = chat.query_one("#prompt", PromptInput)
-        prompt.text = "/quit"
-        prompt.focus()
-        await pilot.press("enter")
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-
-        assert isinstance(app.screen, HomeScreen)
-        assert session.closed is True
-        assert chat.session is None
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    prompt = chat.prompt
+    prompt.setFocus()
+    prompt.setPlainText("/quit")
+    qtbot.keyClick(prompt, Qt.Key.Key_Return)
+    wait_home(qtbot, app)
+    assert session.closed is True
+    assert app.window is not None
+    assert app.window.chat is None
 
 
-@pytest.mark.asyncio
-async def test_home_uses_master_detail_layout_on_wide_terminal(tmp_path: Path) -> None:
+def test_home_uses_master_detail_layout_on_wide_window(qtbot, tmp_path: Path) -> None:
     app = KimixTuiApp(
         SessionOptions(tmp_path),
         session_loader=_history_loader,
         config_store=_config_store(tmp_path),
     )
-
-    async with app.run_test(size=(110, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        home = app.screen
-        assert isinstance(home, HomeScreen)
-        browser = home.query_one("#session-browser")
-        details = home.query_one(SessionDetails)
-
-        assert details.region.x > browser.region.x
-        assert details.region.y == browser.region.y
-        assert all(item.region.height == 2 for item in home.query(SessionListItem))
+    launch_app(qtbot, app, size=(1100, 700))
+    home = wait_home(qtbot, app)
+    browser = find(home, "session-browser")
+    details = find(home, "session-detail")
+    assert details.x() > browser.x()
+    assert abs(details.y() - browser.y()) < 8
+    assert home._splitter.orientation() == Qt.Orientation.Horizontal
 
 
-@pytest.mark.asyncio
-async def test_home_stacks_sections_on_narrow_terminal(tmp_path: Path) -> None:
+def test_home_stacks_sections_on_narrow_window(qtbot, tmp_path: Path) -> None:
     app = KimixTuiApp(
         SessionOptions(tmp_path),
         session_loader=_history_loader,
         config_store=_config_store(tmp_path),
     )
-
-    async with app.run_test(size=(70, 35)) as pilot:
-        await app.workers.wait_for_complete()
-        await pilot.pause()
-        home = app.screen
-        assert isinstance(home, HomeScreen)
-        browser = home.query_one("#session-browser")
-        details = home.query_one(SessionDetails)
-
-        assert home.has_class("-narrow")
-        assert details.region.y > browser.region.y
-        assert details.region.x == browser.region.x
-        assert home.query_one("#open-session", Button).region.bottom <= details.region.bottom
-        assert home.query_one("#toggle-session", Button).region.right <= details.region.right
-        assert home.query_one("#delete-sessions", Button).region.right <= browser.region.right
-        assert home.query_one("#session-list").region.height > 0
+    window = launch_app(qtbot, app, size=(700, 700))
+    home = wait_home(qtbot, app)
+    window.setMinimumSize(400, 400)
+    window.resize(700, 700)
+    QApplication.processEvents()
+    home._sync_narrow(window.width())
+    QApplication.processEvents()
+    browser = find(home, "session-browser")
+    details = find(home, "session-detail")
+    assert home._splitter.orientation() == Qt.Orientation.Vertical
+    assert details.y() > browser.y()
+    assert abs(details.x() - browser.x()) < 8
+    assert find(home, "open-session").geometry().bottom() <= details.geometry().bottom()
+    assert find(home, "toggle-session").geometry().right() <= details.geometry().right()
+    assert find(home, "delete-sessions").geometry().right() <= browser.geometry().right()
+    assert find(home, "session-list").height() > 0

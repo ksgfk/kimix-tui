@@ -8,15 +8,17 @@ Examples:
 from __future__ import annotations
 
 import argparse
-import asyncio
 import ctypes
+import os
 import sys
 import time
 import tracemalloc
 
-from textual.app import App
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from kimix_tui.widgets import MAX_TRANSCRIPT_CHARS, Transcript
+from PySide6.QtWidgets import QApplication
+
+from kimix_tui.qt.transcript import MAX_TRANSCRIPT_CHARS, Transcript
 
 
 def _peak_rss_mib() -> float:
@@ -64,61 +66,54 @@ def _peak_rss_mib() -> float:
     return peak / (1024 if sys.platform != "darwin" else 1024**2)
 
 
-class _BenchmarkApp(App[None]):
-    def compose(self):
-        yield Transcript(id="transcript", max_chars=self.max_chars)
-
-    def __init__(self, max_chars: int) -> None:
-        super().__init__()
-        self.max_chars = max_chars
-
-
-async def _run(args: argparse.Namespace) -> None:
-    app = _BenchmarkApp(args.max_chars)
+def _run(args: argparse.Namespace) -> None:
+    qt_app = QApplication.instance() or QApplication(sys.argv)
+    transcript = Transcript(max_chars=args.max_chars)
+    transcript.resize(max(320, args.width * 8), max(240, args.height * 18))
+    transcript.show()
+    qt_app.processEvents()
     tracemalloc.start()
-    async with app.run_test(size=(args.width, args.height)) as pilot:
-        transcript = app.query_one(Transcript)
-        total_records = int(args.gigabytes * (1024**3) / args.record_bytes)
-        started = time.perf_counter()
-        for start in range(0, total_records, args.chunk):
-            stop = min(total_records, start + args.chunk)
-            await transcript.append_blocks(
-                [
-                    ("assistant", f"{index:08d} " + ("x" * (args.record_bytes - 9)))
-                    for index in range(start, stop)
-                ]
-            )
-        await pilot.pause()
-        append_seconds = time.perf_counter() - started
-        current, peak = tracemalloc.get_traced_memory()
-        print(
-            f"logical={total_records * args.record_bytes / 1024**3:.2f} GiB "
-            f"records={len(transcript.records)} omitted={transcript.omitted_records} "
-            f"append={append_seconds:.2f}s current={current / 1024**2:.1f} MiB "
-            f"heap_peak={peak / 1024**2:.1f} MiB rss_peak={_peak_rss_mib():.1f} MiB"
+    total_records = int(args.gigabytes * (1024**3) / args.record_bytes)
+    started = time.perf_counter()
+    for start in range(0, total_records, args.chunk):
+        stop = min(total_records, start + args.chunk)
+        transcript.append_blocks(
+            [
+                ("assistant", f"{index:08d} " + ("x" * (args.record_bytes - 9)))
+                for index in range(start, stop)
+            ]
         )
+    qt_app.processEvents()
+    append_seconds = time.perf_counter() - started
+    current, peak = tracemalloc.get_traced_memory()
+    print(
+        f"logical={total_records * args.record_bytes / 1024**3:.2f} GiB "
+        f"records={len(transcript.records)} omitted={transcript.omitted_records} "
+        f"append={append_seconds:.2f}s current={current / 1024**2:.1f} MiB "
+        f"heap_peak={peak / 1024**2:.1f} MiB rss_peak={_peak_rss_mib():.1f} MiB"
+    )
 
-        samples: list[float] = []
-        for position in (
-            0,
-            transcript.max_scroll_y // 4,
-            transcript.max_scroll_y // 2,
-            max(0, transcript.max_scroll_y - args.height),
-            transcript.max_scroll_y,
-        ):
-            transcript.scroll_to(y=position, animate=False, immediate=True, force=True)
-            await pilot.pause()
-            started = time.perf_counter()
-            for row in range(transcript.size.height):
-                transcript.render_line(row)
-            samples.append((time.perf_counter() - started) * 1000)
-        _current, peak = tracemalloc.get_traced_memory()
-        print(
-            "scroll_render_ms="
-            + ",".join(f"{sample:.2f}" for sample in samples)
-            + f" cache={len(transcript._strip_cache)} heap_peak={peak / 1024**2:.1f} MiB "
-            + f"rss_peak={_peak_rss_mib():.1f} MiB"
-        )
+    bar = transcript.verticalScrollBar()
+    samples: list[float] = []
+    for position in (
+        0,
+        bar.maximum() // 4,
+        bar.maximum() // 2,
+        max(0, bar.maximum() - args.height),
+        bar.maximum(),
+    ):
+        bar.setValue(position)
+        qt_app.processEvents()
+        started = time.perf_counter()
+        transcript.visible_text()
+        samples.append((time.perf_counter() - started) * 1000)
+    _current, peak = tracemalloc.get_traced_memory()
+    print(
+        "scroll_render_ms="
+        + ",".join(f"{sample:.2f}" for sample in samples)
+        + f" cache={len(transcript._strip_cache)} heap_peak={peak / 1024**2:.1f} MiB "
+        + f"rss_peak={_peak_rss_mib():.1f} MiB"
+    )
 
 
 def main() -> None:
@@ -129,7 +124,7 @@ def main() -> None:
     parser.add_argument("--max-chars", type=int, default=MAX_TRANSCRIPT_CHARS)
     parser.add_argument("--width", type=int, default=100)
     parser.add_argument("--height", type=int, default=35)
-    asyncio.run(_run(parser.parse_args()))
+    _run(parser.parse_args())
 
 
 if __name__ == "__main__":

@@ -5,13 +5,13 @@ build-backend = "hatchling.build"
 [project]
 name = "kimix-tui"
 version = "0.1.0"
-description = "A keyboard-first Textual client for the public Kimi Agent SDK"
+description = "A keyboard-first PySide6 client for the public Kimi Agent SDK"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "kimix>=0.1.29",
     "orjson>=3.11.9",
-    "textual>=8.2,<9",
+    "PySide6>=6.8",
 ]
 
 [tool.uv.sources]
@@ -27,6 +27,7 @@ all = []
 dev = [
     "pytest>=9.0.2",
     "pytest-asyncio>=1.3.0",
+    "pytest-qt>=4.5",
     "ruff>=0.15.10",
 ]
 
@@ -36,6 +37,7 @@ packages = ["src/kimix_tui"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+qt_api = "pyside6"
 
 [tool.ruff]
 target-version = "py314"

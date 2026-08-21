@@ -1,4 +1,4 @@
-"""Keyboard-first TUI for the public Kimi Agent SDK."""
+"""Keyboard-first desktop client for the public Kimi Agent SDK."""
 
 from kimix_tui.app import KimixTuiApp
 from kimix_tui.backend import SessionOptions
