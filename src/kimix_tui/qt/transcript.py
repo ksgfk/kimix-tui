@@ -11,17 +11,22 @@ from PySide6.QtCore import (
     QEvent,
     QModelIndex,
     QPoint,
+    QPointF,
     QRect,
     QSize,
     Qt,
     Signal,
 )
 from PySide6.QtGui import (
+    QAbstractTextDocumentLayout,
     QColor,
-    QFontMetrics,
+    QKeyEvent,
+    QKeySequence,
     QMouseEvent,
     QPainter,
-    QPainterPath,
+    QPalette,
+    QTextCharFormat,
+    QTextCursor,
     QTextDocument,
     QTextOption,
 )
@@ -29,12 +34,13 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QListView,
+    QMenu,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QWidget,
 )
 
-from kimix_tui.qt.paint import layout_record, qcolor
+from kimix_tui.qt.paint import RecordLayout, layout_record, qcolor
 from kimix_tui.qt.theme import COLORS
 from kimix_tui.transcript_layout import (
     COPY_SUFFIX,
@@ -49,7 +55,6 @@ from kimix_tui.transcript_layout import (
 MAX_TRANSCRIPT_CHARS = 64 * 1024 * 1024
 _TRIM_TARGET_RATIO = 0.9
 _DOCUMENT_CACHE_SIZE = 32
-_CARD_RADIUS = 10
 _PAD_X = 12
 _PAD_Y = 8
 _BAR_WIDTH = 3
@@ -68,6 +73,24 @@ class TranscriptRecord:
 
 def _new_record(kind: str, text: str, *, turn: int | None = None) -> TranscriptRecord:
     return TranscriptRecord(kind, text, expanded=default_expanded(kind), turn=turn)
+
+
+@dataclass(slots=True)
+class BodySelection:
+    """Character range inside one transcript body, used for mouse copy."""
+
+    row: int
+    anchor: int
+    position: int
+
+    @property
+    def is_empty(self) -> bool:
+        return self.anchor == self.position
+
+    def normalized(self) -> tuple[int, int]:
+        if self.anchor <= self.position:
+            return self.anchor, self.position
+        return self.position, self.anchor
 
 
 def _record_from_history_item(
@@ -289,13 +312,31 @@ def _estimate_lines(record: TranscriptRecord, width: int) -> int:
     return 1 + body_lines + 1
 
 
+def _layout_for(record: TranscriptRecord, width: int) -> RecordLayout:
+    return layout_record(
+        record.kind,
+        record.text,
+        width=max(24, width // 8),
+        expanded=record.expanded,
+    )
+
+
+def _body_rect(card: QRect) -> QRect:
+    return QRect(
+        card.left() + _PAD_X,
+        card.top() + _HEADER_HEIGHT,
+        card.width() - _PAD_X * 2,
+        card.height() - _HEADER_HEIGHT - _PAD_Y,
+    )
+
+
 class TranscriptDelegate(QStyledItemDelegate):
     """Paints one message card. Documents are created lazily and LRU-cached."""
 
     def __init__(self, view: Transcript) -> None:
         super().__init__(view)
         self._view = view
-        self._documents: OrderedDict[tuple[int, bool, int, str], QTextDocument] = OrderedDict()
+        self._documents: OrderedDict[tuple[object, ...], QTextDocument] = OrderedDict()
 
     def invalidate(self) -> None:
         self._documents.clear()
@@ -328,9 +369,6 @@ class TranscriptDelegate(QStyledItemDelegate):
         )
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        path = QPainterPath()
-        path.addRoundedRect(rect, _CARD_RADIUS, _CARD_RADIUS)
-        painter.fillPath(path, QColor(COLORS["surface"]))
         bar = QRect(rect.left(), rect.top() + 6, _BAR_WIDTH, rect.height() - 12)
         painter.fillRect(bar, qcolor(layout.bar_color))
         header_rect = QRect(
@@ -356,27 +394,35 @@ class TranscriptDelegate(QStyledItemDelegate):
         painter.setFont(font)
         painter.drawText(copy_rect, Qt.AlignmentFlag.AlignCenter, "⧉")
         if not layout.compact and layout.body:
-            body_rect = QRect(
-                rect.left() + _PAD_X,
-                rect.top() + _HEADER_HEIGHT,
-                rect.width() - _PAD_X * 2,
-                rect.height() - _HEADER_HEIGHT - _PAD_Y,
+            body_rect = _body_rect(rect)
+            document = self._document(index.row(), record, body_rect.width(), layout)
+            painter.translate(body_rect.topLeft())
+            painter.setClipRect(QRect(0, 0, body_rect.width(), body_rect.height()))
+            ctx = QAbstractTextDocumentLayout.PaintContext()
+            color = QColor(
+                COLORS["muted"] if not is_dialogue_record(record.kind) else COLORS["text"]
             )
-            if layout.markdown:
-                document = self._document(index.row(), record, body_rect.width())
-                painter.translate(body_rect.topLeft())
-                document.drawContents(painter, QRect(0, 0, body_rect.width(), body_rect.height()))
-            else:
-                font = painter.font()
-                font.setBold(False)
-                font.setItalic(layout.italic_body)
-                painter.setFont(font)
-                painter.setPen(QColor(COLORS["muted"] if not is_dialogue_record(record.kind) else COLORS["text"]))
-                painter.drawText(
-                    body_rect,
-                    Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignTop,
-                    layout.body,
-                )
+            ctx.palette.setColor(QPalette.ColorRole.Text, color)
+            ctx.palette.setColor(QPalette.ColorRole.Base, QColor(0, 0, 0, 0))
+            ctx.palette.setColor(QPalette.ColorRole.Window, QColor(0, 0, 0, 0))
+            selection = self._view._selection
+            if (
+                selection is not None
+                and selection.row == index.row()
+                and not selection.is_empty
+            ):
+                extra = QAbstractTextDocumentLayout.Selection()
+                cursor = QTextCursor(document)
+                start, end = selection.normalized()
+                cursor.setPosition(start)
+                cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+                extra.cursor = cursor
+                fmt = QTextCharFormat()
+                fmt.setBackground(QColor(COLORS["accent"]))
+                fmt.setForeground(QColor("#042f2e"))
+                extra.format = fmt
+                ctx.selections = [extra]
+            document.documentLayout().draw(painter, ctx)
         painter.restore()
 
     def copy_hit(self, option_rect: QRect, pos: QPoint) -> bool:
@@ -387,22 +433,76 @@ class TranscriptDelegate(QStyledItemDelegate):
     def header_hit(self, option_rect: QRect, pos: QPoint) -> bool:
         rect = option_rect.adjusted(8, 4, -8, -4)
         header_rect = QRect(rect.left(), rect.top(), rect.width(), _HEADER_HEIGHT + 4)
-        return header_rect.contains(pos)
+        return header_rect.contains(pos) and not self.copy_hit(option_rect, pos)
+
+    def body_hit(
+        self,
+        option_rect: QRect,
+        pos: QPoint,
+        index: QModelIndex,
+        *,
+        clamp: bool = False,
+    ) -> int | None:
+        record = index.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(record, TranscriptRecord):
+            return None
+        layout = _layout_for(record, option_rect.width())
+        if layout.compact or not layout.body:
+            return None
+        body_rect = _body_rect(option_rect.adjusted(8, 4, -8, -4))
+        if not body_rect.contains(pos):
+            if not clamp or not body_rect.isValid() or body_rect.width() <= 0 or body_rect.height() <= 0:
+                return None
+            pos = QPoint(
+                min(max(pos.x(), body_rect.left()), body_rect.right() - 1),
+                min(max(pos.y(), body_rect.top()), body_rect.bottom() - 1),
+            )
+        document = self._document(index.row(), record, body_rect.width(), layout)
+        local = QPointF(pos.x() - body_rect.left(), pos.y() - body_rect.top())
+        hit = document.documentLayout().hitTest(local, Qt.HitTestAccuracy.FuzzyHit)
+        if hit < 0:
+            return None
+        return min(hit, max(0, document.characterCount() - 1))
+
+    def document_for(self, option_rect: QRect, index: QModelIndex) -> QTextDocument | None:
+        record = index.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(record, TranscriptRecord):
+            return None
+        layout = _layout_for(record, option_rect.width())
+        if layout.compact or not layout.body:
+            return None
+        body_rect = _body_rect(option_rect.adjusted(8, 4, -8, -4))
+        return self._document(index.row(), record, body_rect.width(), layout)
 
     def _body_height(self, record: TranscriptRecord, width: int) -> int:
         inner = max(40, width - _PAD_X * 2 - 16)
-        if record.kind == "assistant":
-            document = self._document(-1, record, inner)
-            return max(_LINE_HEIGHT, int(document.size().height()))
-        metrics = QFontMetrics(QApplication.font()) if QApplication.instance() else QFontMetrics(self._view.font())
-        return max(_LINE_HEIGHT, metrics.boundingRect(0, 0, inner, 10_000, Qt.TextFlag.TextWordWrap, record.text).height())
+        layout = _layout_for(record, width)
+        if layout.compact or not layout.body:
+            return 0
+        document = self._document(-1, record, inner, layout)
+        return max(_LINE_HEIGHT, int(document.size().height()))
 
-    def _document(self, row: int, record: TranscriptRecord, width: int) -> QTextDocument:
-        key = (row, record.expanded, width, record.text)
+    def _document(
+        self,
+        row: int,
+        record: TranscriptRecord,
+        width: int,
+        layout: RecordLayout,
+    ) -> QTextDocument:
+        key = (row, record.expanded, width, layout.body, layout.markdown, layout.italic_body)
         document = self._documents.pop(key, None)
         if document is None:
             document = QTextDocument()
-            document.setMarkdown(record.text)
+            font = QApplication.font() if QApplication.instance() else self._view.font()
+            font.setItalic(layout.italic_body)
+            document.setDefaultFont(font)
+            document.setDefaultStyleSheet(
+                "body, p, pre, code { background-color: transparent; }"
+            )
+            if layout.markdown:
+                document.setMarkdown(layout.body)
+            else:
+                document.setPlainText(layout.body)
             option = QTextOption()
             option.setWrapMode(QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
             document.setDefaultTextOption(option)
@@ -440,11 +540,14 @@ class Transcript(QListView):
         self.setSpacing(2)
         self.setUniformItemSizes(False)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._stick_to_bottom = True
         self._top_event_armed = True
         self._bottom_event_armed = True
         self._last_viewport_turn: int | None = None
         self._wrap_width = 0
+        self._selection: BodySelection | None = None
+        self._selecting = False
         self.verticalScrollBar().valueChanged.connect(self._on_scroll)
         self.viewport().installEventFilter(self)
 
@@ -572,40 +675,173 @@ class Transcript(QListView):
         return record.turn
 
     def eventFilter(self, watched: object, event: object) -> bool:
-        if (
-            watched is self.viewport()
-            and isinstance(event, QMouseEvent)
-            and event.type() == QEvent.Type.MouseButtonPress
-            and self._handle_mouse_press(event)
-        ):
-            return True
+        if watched is self.viewport():
+            if isinstance(event, QMouseEvent):
+                handled = self._handle_mouse_event(event)
+                if handled:
+                    return True
+            if event.type() == QEvent.Type.Leave:
+                self.viewport().unsetCursor()
         return super().eventFilter(watched, event)  # type: ignore[arg-type]
+
+    def keyPressEvent(self, event: object) -> None:
+        if (
+            isinstance(event, QKeyEvent)
+            and event.matches(QKeySequence.StandardKey.Copy)
+            and self._copy_selection()
+        ):
+            event.accept()
+            return
+        super().keyPressEvent(event)  # type: ignore[arg-type]
+
+    def _handle_mouse_event(self, event: QMouseEvent) -> bool:
+        etype = event.type()
+        if etype == QEvent.Type.MouseButtonDblClick:
+            return self._handle_mouse_double_click(event)
+        if etype == QEvent.Type.MouseMove:
+            return self._handle_mouse_move(event)
+        if etype == QEvent.Type.MouseButtonRelease:
+            if event.button() == Qt.MouseButton.LeftButton and self._selecting:
+                self._selecting = False
+                return True
+            return False
+        if etype == QEvent.Type.MouseButtonPress:
+            return self._handle_mouse_press(event)
+        return False
 
     def _handle_mouse_press(self, event: QMouseEvent) -> bool:
         pos = event.position().toPoint()
         index = self.indexAt(pos)
         if not index.isValid():
+            self._clear_selection()
             return False
         record = self.records[index.row()]
         option_rect = self.visualRect(index)
         copy_clicked = self._delegate.copy_hit(option_rect, pos)
         header = self._delegate.header_hit(option_rect, pos)
-        if event.button() == Qt.MouseButton.RightButton or (
-            event.button() == Qt.MouseButton.LeftButton and copy_clicked
-        ):
+        if event.button() == Qt.MouseButton.RightButton:
+            if copy_clicked:
+                self._copy_record(record)
+                return True
+            if self.selected_text():
+                self._popup_copy_menu(event.globalPosition().toPoint())
+            return True
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        if copy_clicked:
             self._copy_record(record)
             return True
-        if (
-            event.button() == Qt.MouseButton.LeftButton
-            and not is_dialogue_record(record.kind)
-            and (not record.expanded or header)
-        ):
+        if not is_dialogue_record(record.kind) and (not record.expanded or header):
             self._model.toggle_expanded(index.row())
             self._delegate.invalidate()
             self.updateGeometries()
             self._maybe_scroll_end()
+            self._clear_selection()
             return True
+        hit = self._delegate.body_hit(option_rect, pos, index)
+        if hit is None:
+            self._clear_selection()
+            return False
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
+        self._selection = BodySelection(index.row(), hit, hit)
+        self._selecting = True
+        self.viewport().update()
+        return True
+
+    def _handle_mouse_double_click(self, event: QMouseEvent) -> bool:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        pos = event.position().toPoint()
+        index = self.indexAt(pos)
+        if not index.isValid():
+            return False
+        option_rect = self.visualRect(index)
+        if self._delegate.copy_hit(option_rect, pos):
+            return True
+        hit = self._delegate.body_hit(option_rect, pos, index)
+        document = self._delegate.document_for(option_rect, index)
+        if hit is None or document is None:
+            return False
+        cursor = QTextCursor(document)
+        cursor.setPosition(min(hit, max(0, document.characterCount() - 1)))
+        cursor.select(QTextCursor.SelectionType.WordUnderCursor)
+        self._selection = BodySelection(
+            index.row(),
+            cursor.selectionStart(),
+            cursor.selectionEnd(),
+        )
+        self._selecting = False
+        self.viewport().update()
+        return True
+
+    def _handle_mouse_move(self, event: QMouseEvent) -> bool:
+        pos = event.position().toPoint()
+        if self._selecting and self._selection is not None:
+            index = self._model.index(self._selection.row)
+            if index.isValid():
+                hit = self._delegate.body_hit(self.visualRect(index), pos, index, clamp=True)
+                if hit is not None:
+                    self._selection.position = hit
+                    self.viewport().update()
+            return True
+        self._sync_cursor(pos)
         return False
+
+    def _sync_cursor(self, pos: QPoint) -> None:
+        index = self.indexAt(pos)
+        if not index.isValid():
+            self.viewport().unsetCursor()
+            return
+        option_rect = self.visualRect(index)
+        if self._delegate.copy_hit(option_rect, pos):
+            self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+            return
+        record = self.records[index.row()]
+        if not is_dialogue_record(record.kind) and self._delegate.header_hit(option_rect, pos):
+            self.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
+            return
+        if self._delegate.body_hit(option_rect, pos, index) is not None:
+            self.viewport().setCursor(Qt.CursorShape.IBeamCursor)
+            return
+        self.viewport().unsetCursor()
+
+    def selected_text(self) -> str:
+        selection = self._selection
+        if selection is None or selection.is_empty:
+            return ""
+        index = self._model.index(selection.row)
+        if not index.isValid():
+            return ""
+        document = self._delegate.document_for(self.visualRect(index), index)
+        if document is None:
+            return ""
+        start, end = selection.normalized()
+        limit = max(0, document.characterCount() - 1)
+        start = max(0, min(start, limit))
+        end = max(0, min(end, limit))
+        cursor = QTextCursor(document)
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.MoveMode.KeepAnchor)
+        return cursor.selectedText().replace("\u2029", "\n")
+
+    def _copy_selection(self) -> bool:
+        text = self.selected_text()
+        if not text:
+            return False
+        QApplication.clipboard().setText(text)
+        return True
+
+    def _clear_selection(self) -> None:
+        self._selecting = False
+        if self._selection is not None:
+            self._selection = None
+            self.viewport().update()
+
+    def _popup_copy_menu(self, global_pos: QPoint) -> None:
+        menu = QMenu(self)
+        action = menu.addAction("Copy")
+        action.triggered.connect(self._copy_selection)
+        menu.popup(global_pos)
 
     def resizeEvent(self, event: object) -> None:
         super().resizeEvent(event)  # type: ignore[arg-type]

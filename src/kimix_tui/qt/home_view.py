@@ -6,9 +6,19 @@ from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QSize, Qt, Signal
-from PySide6.QtGui import QKeyEvent, QKeySequence, QMouseEvent, QShortcut
+from PySide6.QtCore import QEvent, QPoint, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QKeyEvent,
+    QKeySequence,
+    QMouseEvent,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
+    QCheckBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -22,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from kimix_tui.llm_config import LLMConfigReference, config_file_available
+from kimix_tui.qt.theme import COLORS
 from kimix_tui.session_index import (
     SessionSummary,
     format_file_size,
@@ -30,52 +41,159 @@ from kimix_tui.session_index import (
 
 SessionConfigLoader = Callable[[str], LLMConfigReference | None]
 
+_MARK_SIZE = 22
+_ROW_HEIGHT = 58
+
+
+class SelectionMark(QCheckBox):
+    """Circular checkbox used for batch-selecting sessions."""
+
+    def __init__(self, parent: QWidget | None = None, *, object_name: str = "session-check") -> None:
+        super().__init__(parent)
+        self.setObjectName(object_name)
+        self.setText("")
+        self.setFixedSize(_MARK_SIZE, _MARK_SIZE)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self._forced = False
+
+    def set_forced(self, forced: bool) -> None:
+        self._forced = forced
+        self.update()
+
+    def hitButton(self, pos: QPoint) -> bool:
+        return self.rect().contains(pos)
+
+    def paintEvent(self, event: object) -> None:
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        checked = self.isChecked()
+        mixed = self.checkState() == Qt.CheckState.PartiallyChecked
+        idle = not (checked or mixed or self._forced or self.underMouse() or self.isDown())
+        painter.setOpacity(1.0 if not idle else 0.42)
+        box = QRectF(2.5, 2.5, 17, 17)
+        if checked:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(COLORS["accent"]))
+            painter.drawEllipse(box)
+            pen = QPen(QColor("#042f2e"), 1.8)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            mark = QPainterPath()
+            mark.moveTo(7.2, 11.2)
+            mark.lineTo(10.0, 14.1)
+            mark.lineTo(15.2, 8.0)
+            painter.drawPath(mark)
+            return
+        border = QColor(COLORS["accent"] if mixed or self.underMouse() or self.isDown() else COLORS["muted"])
+        painter.setPen(QPen(border, 1.6))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(box)
+        if mixed:
+            dash = QPen(QColor(COLORS["accent"]), 2.0)
+            dash.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(dash)
+            painter.drawLine(7, 11, 15, 11)
+
 
 class SessionRow(QWidget):
-    """Compact selectable row for a saved session."""
+    """Selectable session card: click previews, the mark batch-selects."""
 
     check_toggled = Signal(str)
+    opened = Signal(str)
 
     def __init__(self, summary: SessionSummary, *, selected: bool = False) -> None:
         super().__init__()
         self.summary = summary
         self.selected = selected
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 4)
-        layout.setSpacing(0)
-        main = QHBoxLayout()
-        self._check = QLabel("[x]" if selected else "[ ]")
-        self._check.setObjectName("session-check")
-        self._check.setProperty("session_id", summary.id)
+        self._active = False
+        self._hovered = False
+        self._selection_mode = False
+        self.setObjectName("session-row")
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setMouseTracking(True)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 8, 12, 8)
+        layout.setSpacing(10)
+        self._check = SelectionMark(self)
+        self._check.setChecked(selected)
+        self._check.clicked.connect(self._emit_check)
+        layout.addWidget(self._check, 0, Qt.AlignmentFlag.AlignVCenter)
+        text = QVBoxLayout()
+        text.setContentsMargins(0, 0, 0, 0)
+        text.setSpacing(2)
         title = QLabel(summary.title)
         title.setObjectName("session-title")
         title.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self._check.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        main.addWidget(self._check)
-        main.addWidget(title, 1)
         meta = QLabel(
             f"{format_relative_time(summary.updated_at)} · {format_file_size(summary.size_bytes)}"
         )
         meta.setObjectName("session-meta")
         meta.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        layout.addLayout(main)
-        layout.addWidget(meta)
+        text.addWidget(title)
+        text.addWidget(meta)
+        layout.addLayout(text, 1)
+        self._badge = QLabel()
+        self._badge.setObjectName("session-badge")
+        self._badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        if summary.is_archived:
+            self._badge.setText("Archived")
+            self._badge.setProperty("kind", "archived")
+        elif summary.is_last:
+            self._badge.setText("Last")
+            self._badge.setProperty("kind", "last")
+        else:
+            self._badge.hide()
+        self._badge.style().unpolish(self._badge)
+        self._badge.style().polish(self._badge)
+        layout.addWidget(self._badge, 0, Qt.AlignmentFlag.AlignVCenter)
         self.set_selected(selected)
+
+    @property
+    def checked(self) -> bool:
+        return self._check.isChecked()
 
     def set_selected(self, selected: bool) -> None:
         self.selected = selected
-        self._check.setText("[x]" if selected else "[ ]")
+        self._check.blockSignals(True)
+        self._check.setChecked(selected)
+        self._check.blockSignals(False)
+        self._check.set_forced(self._selection_mode or self._hovered or selected)
+        self._check.update()
+
+    def set_active(self, active: bool) -> None:
+        if self._active == active:
+            return
+        self._active = active
+        self.update()
+
+    def set_selection_mode(self, active: bool) -> None:
+        self._selection_mode = active
+        self._check.set_forced(active or self._hovered or self.selected)
+
+    def _emit_check(self) -> None:
+        self.check_toggled.emit(self.summary.id)
+
+    def enterEvent(self, event: object) -> None:
+        self._hovered = True
+        self._check.set_forced(True)
+        self.update()
+        super().enterEvent(event)  # type: ignore[arg-type]
+
+    def leaveEvent(self, event: object) -> None:
+        self._hovered = False
+        self._check.set_forced(self._selection_mode or self.selected)
+        self.update()
+        super().leaveEvent(event)  # type: ignore[arg-type]
 
     def mousePressEvent(self, event: object) -> None:
         if not isinstance(event, QMouseEvent):
             return
-        child = self.childAt(event.position().toPoint())
-        check_rect = self._check.geometry()
-        if child is self._check or (
-            check_rect.contains(event.position().toPoint()) and event.position().x() <= check_rect.right()
-        ):
-            self.check_toggled.emit(self.summary.id)
-            event.accept()
+        if self.childAt(event.position().toPoint()) is self._check:
             return
         list_widget = self._list_widget()
         if list_widget is not None:
@@ -85,6 +203,30 @@ class SessionRow(QWidget):
                     list_widget.setCurrentRow(index)
                     break
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: object) -> None:
+        if not isinstance(event, QMouseEvent):
+            return
+        if self.childAt(event.position().toPoint()) is self._check:
+            return
+        self.opened.emit(self.summary.id)
+        event.accept()
+
+    def paintEvent(self, event: object) -> None:
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        if self._active:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(COLORS["boost"]))
+            painter.drawRoundedRect(rect, 10, 10)
+            painter.setBrush(QColor(COLORS["accent"]))
+            painter.drawRoundedRect(QRectF(1.5, 14, 3, rect.height() - 28), 1.5, 1.5)
+        elif self._hovered:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(COLORS["panel"]))
+            painter.drawRoundedRect(rect, 10, 10)
 
     def _list_widget(self) -> QListWidget | None:
         parent = self.parentWidget()
@@ -127,12 +269,15 @@ class HomeView(QWidget):
 
     def _build(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 12)
+        root.setContentsMargins(20, 16, 20, 16)
+        root.setSpacing(12)
         toolbar = QFrame()
         toolbar.setObjectName("home-toolbar")
         toolbar_layout = QHBoxLayout(toolbar)
+        toolbar_layout.setContentsMargins(4, 4, 4, 8)
         context = QVBoxLayout()
-        title = QLabel("SESSIONS")
+        context.setSpacing(2)
+        title = QLabel("Sessions")
         title.setObjectName("home-title")
         path = QLabel(str(self._work_dir))
         path.setObjectName("home-path")
@@ -142,7 +287,7 @@ class HomeView(QWidget):
         context.addWidget(path)
         context.addWidget(self._home_model)
         toolbar_layout.addLayout(context, 1)
-        new_btn = QPushButton("+ New session")
+        new_btn = QPushButton("New session")
         new_btn.setObjectName("start-new-session")
         self._new_btn = new_btn
         settings = QPushButton("Settings")
@@ -156,46 +301,66 @@ class HomeView(QWidget):
         browser = QWidget()
         browser.setObjectName("session-browser")
         browser_layout = QVBoxLayout(browser)
-        header = QHBoxLayout()
-        history_title = QLabel("History")
-        history_title.setObjectName("history-title")
-        self._session_count = QLabel("")
-        self._session_count.setObjectName("session-count")
-        header.addWidget(history_title)
-        header.addWidget(self._session_count)
-        browser_layout.addLayout(header)
-        self._search = QLineEdit()
-        self._search.setObjectName("session-search")
-        self._search.setPlaceholderText("Search by title")
-        browser_layout.addWidget(self._search)
-        batch = QHBoxLayout()
+        browser_layout.setContentsMargins(0, 0, 8, 0)
+        browser_layout.setSpacing(8)
+        header_bar = QWidget()
+        header_bar.setObjectName("history-header")
+        header_bar.setFixedHeight(32)
+        header = QHBoxLayout(header_bar)
+        header.setContentsMargins(0, 0, 0, 0)
+        header.setSpacing(8)
+        self._history_title = QLabel("History")
+        self._history_title.setObjectName("history-title")
         self._selection_count = QLabel("0 selected")
         self._selection_count.setObjectName("selection-count")
-        self._select_shown = QPushButton("Select shown")
+        self._session_count = QLabel("")
+        self._session_count.setObjectName("session-count")
+        self._select_shown = QPushButton("Select all")
         self._select_shown.setObjectName("select-shown")
         self._select_shown.setEnabled(False)
+        self._select_shown.setFlat(True)
+        self._select_shown.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._select_shown.setFixedHeight(28)
         self._delete = QPushButton("Delete")
         self._delete.setObjectName("delete-sessions")
         self._delete.setEnabled(False)
-        batch.addWidget(self._selection_count, 1)
-        batch.addWidget(self._select_shown)
-        batch.addWidget(self._delete)
-        browser_layout.addLayout(batch)
+        self._delete.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._delete.setFixedHeight(28)
+        header.addWidget(self._history_title)
+        header.addWidget(self._selection_count)
+        header.addStretch()
+        header.addWidget(self._select_shown)
+        header.addWidget(self._delete)
+        header.addWidget(self._session_count)
+        browser_layout.addWidget(header_bar)
+        self._search = QLineEdit()
+        self._search.setObjectName("session-search")
+        self._search.setPlaceholderText("Search sessions")
+        self._search.setClearButtonEnabled(True)
+        browser_layout.addWidget(self._search)
+
         self._status = QLabel("Loading sessions…")
         self._status.setObjectName("home-status")
         browser_layout.addWidget(self._status)
         self._list = QListWidget()
         self._list.setObjectName("session-list")
+        self._list.setUniformItemSizes(True)
+        self._list.setSpacing(2)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._list.setVerticalScrollMode(QListWidget.ScrollMode.ScrollPerPixel)
+        self._list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self._list.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._list.installEventFilter(self)
         self._list.currentRowChanged.connect(self._on_row_changed)
-        self._list.itemActivated.connect(self._open_current)
         browser_layout.addWidget(self._list, 1)
         self._splitter.addWidget(browser)
 
-        self._details = QWidget()
+        self._details = QFrame()
         self._details.setObjectName("session-detail")
         details_layout = QVBoxLayout(self._details)
-        overline = QLabel("SESSION DETAILS")
+        details_layout.setContentsMargins(18, 16, 18, 16)
+        details_layout.setSpacing(8)
+        overline = QLabel("Details")
         overline.setObjectName("detail-overline")
         self._detail_title = QLabel("Loading sessions…")
         self._detail_title.setObjectName("detail-title")
@@ -206,22 +371,22 @@ class HomeView(QWidget):
         details_layout.addWidget(self._detail_title)
         details_layout.addWidget(self._detail_state)
         actions = QHBoxLayout()
+        actions.setSpacing(8)
         self._open = QPushButton("Open session")
         self._open.setObjectName("open-session")
         self._open.setEnabled(False)
         self._configure = QPushButton("Configure")
         self._configure.setObjectName("configure-session")
         self._configure.setEnabled(False)
-        self._toggle = QPushButton("Select")
-        self._toggle.setObjectName("toggle-session")
-        self._toggle.setEnabled(False)
         actions.addWidget(self._open)
         actions.addWidget(self._configure)
-        actions.addWidget(self._toggle)
+        actions.addStretch()
         details_layout.addLayout(actions)
         self._meta = QWidget()
         self._meta.setObjectName("detail-metadata")
         form = QVBoxLayout(self._meta)
+        form.setContentsMargins(0, 8, 0, 0)
+        form.setSpacing(8)
         self._detail_values: dict[str, QLabel] = {}
         for key, label in (
             ("detail-updated", "Updated"),
@@ -241,6 +406,7 @@ class HomeView(QWidget):
             name.setFixedWidth(110)
             value = QLabel("")
             value.setObjectName(key)
+            value.setWordWrap(True)
             value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
             self._detail_values[key] = value
             row.addWidget(name)
@@ -262,12 +428,12 @@ class HomeView(QWidget):
         settings.clicked.connect(self.open_settings.emit)
         self._open.clicked.connect(self._open_current)
         self._configure.clicked.connect(self._configure_current)
-        self._toggle.clicked.connect(self.toggle_selected)
         self._select_shown.clicked.connect(self._toggle_shown)
         self._delete.clicked.connect(self.request_delete)
         self._search.textChanged.connect(self._render_sessions)
         search_shortcut = QShortcut(QKeySequence("Ctrl+F"), self, self.focus_search)
         search_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._update_selection_controls([])
 
     @property
     def summary(self) -> SessionSummary | None:
@@ -303,6 +469,7 @@ class HomeView(QWidget):
         self._status.setText(f"Could not load sessions: {message}")
         self._session_count.setText("Unavailable")
         self._show_empty("Sessions unavailable", "Start a new session to continue")
+        self._update_selection_controls([])
 
     def refresh_configuration(self, default_config: LLMConfigReference) -> None:
         self._default_config = default_config
@@ -440,9 +607,10 @@ class HomeView(QWidget):
         select_row = 0
         for index, summary in enumerate(filtered):
             row = SessionRow(summary, selected=summary.id in self._selected_ids)
-            row.check_toggled.connect(self._toggle_id)
+            row.check_toggled.connect(self._on_mark_clicked)
+            row.opened.connect(self._open_id)
             item = QListWidgetItem()
-            item.setSizeHint(QSize(100, 48))
+            item.setSizeHint(QSize(100, _ROW_HEIGHT))
             self._list.addItem(item)
             self._list.setItemWidget(item, row)
             if summary.id == current_id:
@@ -464,6 +632,10 @@ class HomeView(QWidget):
         return widget if isinstance(widget, SessionRow) else None
 
     def _on_row_changed(self, row: int) -> None:
+        for index in range(self._list.count()):
+            session_row = self._row_at(index)
+            if session_row is not None:
+                session_row.set_active(index == row)
         session_row = self._row_at(row)
         if session_row is None:
             self._show_empty("No session selected", "")
@@ -505,7 +677,6 @@ class HomeView(QWidget):
         self._detail_values["detail-path"].setText(str(self._work_dir))
         self._open.setEnabled(True)
         self._configure.setEnabled(True)
-        self._toggle.setEnabled(True)
 
     def _show_empty(self, title: str, state: str) -> None:
         self._detail_title.setText(title)
@@ -513,19 +684,25 @@ class HomeView(QWidget):
         self._meta.hide()
         self._open.setEnabled(False)
         self._configure.setEnabled(False)
-        self._toggle.setEnabled(False)
 
     def _update_selection_controls(self, filtered: list[SessionSummary] | None = None) -> None:
         count = len(self._selected_ids)
+        selecting = count > 0
         self._selection_count.setText(f"{count} selected")
-        self._delete.setEnabled(count > 0)
+        self._selection_count.setVisible(selecting)
+        self._history_title.setVisible(not selecting)
+        self._session_count.setVisible(not selecting)
+        self._delete.setEnabled(selecting)
+        self._delete.setVisible(selecting)
         if filtered is None:
             filtered = [row.summary for row in self.session_rows()]
-        self._select_shown.setEnabled(bool(filtered))
-        all_selected = bool(filtered) and all(item.id in self._selected_ids for item in filtered)
-        self._select_shown.setText("Clear shown" if all_selected else "Select shown")
-        selected = self.summary is not None and self.summary.id in self._selected_ids
-        self._toggle.setText("Deselect" if selected else "Select")
+        has_rows = bool(filtered)
+        self._select_shown.setEnabled(has_rows)
+        self._select_shown.setVisible(has_rows)
+        all_selected = has_rows and all(item.id in self._selected_ids for item in filtered)
+        self._select_shown.setText("Clear" if all_selected else "Select all")
+        for row in self.session_rows():
+            row.set_selection_mode(selecting)
 
     def _toggle_shown(self) -> None:
         rows = self.session_rows()
@@ -540,11 +717,17 @@ class HomeView(QWidget):
             row.set_selected(row.summary.id in self._selected_ids)
         self._update_selection_controls()
 
-    def _toggle_id(self, session_id: str) -> None:
+    def _on_mark_clicked(self, session_id: str) -> None:
         for row in self.session_rows():
-            if row.summary.id == session_id:
-                self._toggle_row(row)
-                return
+            if row.summary.id != session_id:
+                continue
+            if row.checked:
+                self._selected_ids.add(session_id)
+            else:
+                self._selected_ids.discard(session_id)
+            row.selected = row.checked
+            self._update_selection_controls()
+            return
 
     def _toggle_row(self, row: SessionRow) -> None:
         session_id = row.summary.id
@@ -560,8 +743,15 @@ class HomeView(QWidget):
         if summary is not None:
             self._open_summary(summary)
 
+    def _open_id(self, session_id: str) -> None:
+        for row in self.session_rows():
+            if row.summary.id == session_id:
+                self._open_summary(row.summary)
+                return
+
     def _open_summary(self, summary: SessionSummary) -> None:
-        if not self.configuration_available:
+        saved = self._session_config_loader(summary.id)
+        if not config_file_available(saved or self._default_config):
             self.llm_required.emit(summary.id)
             return
         self.resume_session.emit(summary.id)

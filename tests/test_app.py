@@ -20,7 +20,7 @@ from kimi_agent_sdk import (
     TurnEnd,
 )
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QLabel, QPushButton
+from PySide6.QtWidgets import QDialog, QLabel, QPlainTextEdit, QPushButton
 from qtutil import find, launch_app, wait_chat_ready, wait_home, wait_idle, widget_text
 
 from kimix_tui.app import KimixTuiApp
@@ -28,6 +28,7 @@ from kimix_tui.backend import SessionOptions
 from kimix_tui.history import HistoryBlock, SessionHistory, Timeline
 from kimix_tui.llm_config import LLMConfigStore, inspect_llm_config
 from kimix_tui.qt.chat_view import ChatView
+from kimix_tui.qt.composer import Composer
 from kimix_tui.qt.home_view import HomeView
 from kimix_tui.qt.request_dialogs import ApprovalDialog
 
@@ -187,6 +188,114 @@ def test_chat_prompt_stays_within_screen(qtbot, tmp_path: Path) -> None:
         qtbot.keyClick(prompt, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier)
     assert prompt.x() >= 0
     assert prompt.geometry().right() <= chat.width()
+
+
+def test_send_button_submits_prompt(qtbot, tmp_path: Path) -> None:
+    session = FakeSession([TextPart(text="ok"), TurnEnd()])
+
+    async def factory(_options: SessionOptions) -> FakeSession:
+        return session
+
+    app = KimixTuiApp(
+        SessionOptions(tmp_path, session_id="fake-session"),
+        session_factory=factory,
+        config_store=_config_store(tmp_path),
+    )
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    send = find(chat, "send-prompt", QPushButton)
+    cancel = find(chat, "cancel-prompt", QPushButton)
+    assert send.text() == "Send"
+    assert cancel.text() == "Cancel"
+    assert send.isVisible() is True
+    assert send.isEnabled() is False
+    assert cancel.isVisible() is False
+    assert send.x() >= chat.prompt.geometry().right()
+    assert chat.prompt.height() == Composer.MIN_HEIGHT
+    assert send.height() == Composer.ACTION_HEIGHT
+    assert "Ctrl+Enter" in chat.prompt.placeholderText()
+
+    chat.prompt.setPlainText("hello from send")
+    assert send.isEnabled() is True
+    send.click()
+    qtbot.waitUntil(lambda: session.prompts == ["hello from send"], timeout=10_000)
+    wait_idle(qtbot, app)
+    assert chat.prompt.text == ""
+    assert send.isEnabled() is False
+
+
+def test_expand_prompt_opens_pad_and_sends(qtbot, tmp_path: Path) -> None:
+    session = FakeSession([TextPart(text="ok"), TurnEnd()])
+
+    async def factory(_options: SessionOptions) -> FakeSession:
+        return session
+
+    app = KimixTuiApp(
+        SessionOptions(tmp_path, session_id="fake-session"),
+        session_factory=factory,
+        config_store=_config_store(tmp_path),
+    )
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    find(chat.prompt, "expand-prompt", QPushButton).click()
+    pad = find(chat, "composer-pad", QDialog)
+    qtbot.waitUntil(pad.isVisible, timeout=5_000)
+    editor = find(pad, "prompt-pad", QPlainTextEdit)
+    long_text = "paste\n" * 40 + "done"
+    editor.setPlainText(long_text)
+    find(pad, "send-pad", QPushButton).click()
+    qtbot.waitUntil(lambda: session.prompts == [long_text], timeout=10_000)
+    wait_idle(qtbot, app)
+    assert chat.prompt.text == ""
+    assert pad.isVisible() is False
+
+
+def test_expand_prompt_keeps_draft_on_close(qtbot, tmp_path: Path) -> None:
+    session = FakeSession([TurnEnd()])
+
+    async def factory(_options: SessionOptions) -> FakeSession:
+        return session
+
+    app = KimixTuiApp(
+        SessionOptions(tmp_path, session_id="fake-session"),
+        session_factory=factory,
+        config_store=_config_store(tmp_path),
+    )
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    find(chat.prompt, "expand-prompt", QPushButton).click()
+    pad = find(chat, "composer-pad", QDialog)
+    qtbot.waitUntil(pad.isVisible, timeout=5_000)
+    find(pad, "prompt-pad", QPlainTextEdit).setPlainText("keep this draft")
+    find(pad, "close-composer-pad", QPushButton).click()
+    qtbot.waitUntil(lambda: not pad.isVisible(), timeout=5_000)
+    assert chat.prompt.text == "keep this draft"
+    assert session.prompts == []
+
+
+def test_cancel_button_stops_generation(qtbot, tmp_path: Path) -> None:
+    session = FakeSession([TextPart(text="partial")], hang_prompt=True)
+
+    async def factory(_options: SessionOptions) -> FakeSession:
+        return session
+
+    app = KimixTuiApp(
+        SessionOptions(tmp_path, session_id="fake-session"),
+        session_factory=factory,
+        config_store=_config_store(tmp_path),
+    )
+    launch_app(qtbot, app)
+    chat = wait_chat_ready(qtbot, app)
+    _submit(qtbot, chat, "cont")
+    qtbot.waitUntil(lambda: session.prompt_started.is_set(), timeout=10_000)
+    cancel = find(chat, "cancel-prompt", QPushButton)
+    qtbot.waitUntil(lambda: cancel.isVisible() and cancel.isEnabled(), timeout=10_000)
+    assert find(chat, "send-prompt", QPushButton).isVisible() is False
+    cancel.click()
+    wait_idle(qtbot, app)
+    assert session.cancelled is True
+    assert chat.busy is False
+    assert chat.prompt_enabled is True
 
 
 def test_chat_live_stream_keeps_timeline_and_appends_at_tail(
@@ -383,7 +492,7 @@ def test_chat_chrome_keeps_history_toolbar(qtbot, tmp_path: Path) -> None:
     status = find(chat, "status", QLabel)
     context = find(chat, "context", QLabel)
     assert status.parent().objectName() == "chat-toolbar"
-    assert context.parent().objectName() == "chat-footer"
+    assert context.parent().objectName() == "composer-dock"
     assert "connecting" in status.text() or "session" in status.text().casefold()
     assert "context" in context.text() or "ready" in context.text().casefold()
 

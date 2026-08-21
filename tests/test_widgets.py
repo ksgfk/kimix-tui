@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPlainTextEdit, QPushButton, QWidget
 
-from kimix_tui.qt.composer import Composer
+from kimix_tui.qt.composer import Composer, ComposerPad
+from kimix_tui.qt.main_window import Toast
 from kimix_tui.qt.transcript import MAX_TRANSCRIPT_CHARS, Transcript
 
 
@@ -111,7 +112,7 @@ def test_only_explicit_copy_action_copies_dialogue_message(qtbot) -> None:
     qtbot.mouseClick(transcript.viewport(), Qt.MouseButton.LeftButton, pos=_copy_pos(transcript, 2))
     assert clipboard.text() == "First answer"
     qtbot.mouseClick(transcript.viewport(), Qt.MouseButton.RightButton, pos=_header_pos(transcript, 3))
-    assert clipboard.text() == "Read file\nPath: example.py"
+    assert clipboard.text() == "First answer"
 
 
 def test_clicking_copy_action_on_system_record_copies_only_that_record(qtbot) -> None:
@@ -126,6 +127,45 @@ def test_clicking_copy_action_on_system_record_copies_only_that_record(qtbot) ->
     qtbot.waitUntil(lambda: transcript.visualRect(transcript.model().index(0, 0)).height() > 0)
     qtbot.mouseClick(transcript.viewport(), Qt.MouseButton.LeftButton, pos=_copy_pos(transcript, 0))
     assert QApplication.clipboard().text() == "Session: demo"
+
+
+def test_drag_selects_body_text_and_ctrl_c_copies_selection(qtbot) -> None:
+    transcript = _shown(qtbot, width=640, height=400)
+    transcript.append_block("user", "ALPHA-SELECTABLE-TEXT OMEGA")
+    qtbot.waitUntil(lambda: transcript.visualRect(transcript.model().index(0, 0)).height() > 0)
+    rect = transcript.visualRect(transcript.model().index(0, 0))
+    start = QPoint(rect.left() + 24, rect.top() + 36)
+    end = QPoint(rect.left() + 220, rect.top() + 36)
+    qtbot.mousePress(transcript.viewport(), Qt.MouseButton.LeftButton, pos=start)
+    qtbot.mouseMove(transcript.viewport(), pos=end)
+    qtbot.mouseRelease(transcript.viewport(), Qt.MouseButton.LeftButton, pos=end)
+    selected = transcript.selected_text()
+    assert selected
+    assert selected in "ALPHA-SELECTABLE-TEXT OMEGA"
+    clipboard = QApplication.clipboard()
+    clipboard.setText("unchanged")
+    transcript.setFocus()
+    qtbot.keyClick(transcript, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    assert clipboard.text() == selected
+
+
+def test_clicking_body_does_not_copy_without_selection(qtbot) -> None:
+    transcript = _shown(qtbot)
+    transcript.append_block("assistant", "Selectable assistant reply")
+    qtbot.waitUntil(lambda: transcript.visualRect(transcript.model().index(0, 0)).height() > 0)
+    clipboard = QApplication.clipboard()
+    clipboard.setText("unchanged")
+    rect = transcript.visualRect(transcript.model().index(0, 0))
+    qtbot.mouseClick(
+        transcript.viewport(),
+        Qt.MouseButton.LeftButton,
+        pos=QPoint(rect.left() + 24, rect.top() + 36),
+    )
+    assert clipboard.text() == "unchanged"
+    assert transcript.selected_text() == ""
+    transcript.setFocus()
+    qtbot.keyClick(transcript, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    assert clipboard.text() == "unchanged"
 
 
 def test_auxiliary_record_expands_collapses_and_copies_from_action(qtbot) -> None:
@@ -347,7 +387,81 @@ def test_prompt_grows_with_lines_and_caps_height(qtbot) -> None:
     prompt.show()
     prompt.setFocus()
     assert prompt.height() == Composer.MIN_HEIGHT
+    assert prompt.verticalScrollBar().isVisible() is False
+    prompt.setPlainText("one line of prompt text")
+    assert prompt.height() == Composer.MIN_HEIGHT
+    assert prompt.verticalScrollBar().isVisible() is False
     for _ in range(20):
         qtbot.keyClick(prompt, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier)
     assert prompt.height() == Composer.MAX_HEIGHT
     assert prompt.text.count("\n") == 20
+    assert prompt.verticalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAsNeeded
+
+
+def test_composer_expand_emits_and_pad_sends_long_text(qtbot) -> None:
+    prompt = Composer("Ask")
+    opened: list[int] = []
+    prompt.expand_requested.connect(lambda: opened.append(1))
+    qtbot.addWidget(prompt)
+    prompt.show()
+    expand = prompt.findChild(QPushButton, "expand-prompt")
+    assert expand is not None
+    expand.click()
+    assert opened == [1]
+    assert prompt.height() == Composer.MIN_HEIGHT
+
+    submitted: list[str] = []
+    long_text = "line\n" * 80 + "end"
+    pad = ComposerPad(long_text)
+    pad.submitted.connect(submitted.append)
+    qtbot.addWidget(pad)
+    pad.show()
+    assert pad.findChild(QWidget, "prompt-pad") is not None
+    send = pad.findChild(QPushButton, "send-pad")
+    assert send is not None
+    send.click()
+    assert submitted == [long_text]
+    assert pad.sent is True
+
+
+def test_composer_pad_keeps_draft_and_uses_ctrl_enter(qtbot) -> None:
+    pad = ComposerPad("hello")
+    submitted: list[str] = []
+    pad.submitted.connect(submitted.append)
+    qtbot.addWidget(pad)
+    pad.show()
+    editor = pad.findChild(QPlainTextEdit, "prompt-pad")
+    assert editor is not None
+    editor.setFocus()
+    editor.setPlainText("hello\nworld")
+    qtbot.keyClick(editor, Qt.Key.Key_Return)
+    assert submitted == []
+    editor.setPlainText("hello\nworld")
+    qtbot.keyClick(editor, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier)
+    assert submitted == ["hello\nworld"]
+
+
+def test_toast_centers_at_bottom_and_auto_hides(qtbot) -> None:
+    host = QWidget()
+    host.resize(800, 600)
+    qtbot.addWidget(host)
+    host.show()
+    toast = Toast(host)
+    toast.show_message("AI message copied", duration_ms=80)
+    assert toast.isVisible()
+    mid = toast.x() + toast.width() / 2
+    assert abs(mid - 400) < 24
+    assert toast.y() + toast.height() > 520
+    qtbot.waitUntil(lambda: not toast.isVisible(), timeout=3_000)
+
+
+def test_toast_click_dismisses_before_timer(qtbot) -> None:
+    host = QWidget()
+    host.resize(800, 600)
+    qtbot.addWidget(host)
+    host.show()
+    toast = Toast(host)
+    toast.show_message("Copied", duration_ms=10_000)
+    assert toast.isVisible()
+    qtbot.mouseClick(toast, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: not toast.isVisible(), timeout=3_000)

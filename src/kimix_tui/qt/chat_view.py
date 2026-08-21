@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from kimix_tui.qt.bridge import HistoryPage, KimixBridge, TranscriptDelta
-from kimix_tui.qt.composer import Composer
+from kimix_tui.qt.composer import Composer, ComposerPad
 from kimix_tui.qt.transcript import Transcript
 
 
@@ -40,6 +40,7 @@ class ChatView(QWidget):
         self._history_loading = False
         self._session_label = "connecting…"
         self._context_text = ""
+        self._pad: ComposerPad | None = None
         self._build()
         self._connect_bridge()
 
@@ -98,21 +99,35 @@ class ChatView(QWidget):
         self.transcript = Transcript()
         root.addWidget(self.transcript, 1)
 
-        self.prompt = Composer("Ask AI, or type /help")
+        dock = QFrame()
+        dock.setObjectName("composer-dock")
+        dock_layout = QVBoxLayout(dock)
+        dock_layout.setContentsMargins(16, 8, 16, 8)
+        dock_layout.setSpacing(6)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        self.prompt = Composer("Ask AI, or type /help. Ctrl+Enter for a new line")
         self.prompt.setEnabled(False)
-        root.addWidget(self.prompt)
-
-        footer = QFrame()
-        footer.setObjectName("chat-footer")
-        footer_layout = QHBoxLayout(footer)
-        hint = QLabel("Ctrl+G cancel")
-        hint.setObjectName("chat-hint")
+        self._cancel = QPushButton("Cancel")
+        self._cancel.setObjectName("cancel-prompt")
+        self._cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cancel.setToolTip("Stop generation")
+        self._cancel.setFixedHeight(Composer.ACTION_HEIGHT)
+        self._send = QPushButton("Send")
+        self._send.setObjectName("send-prompt")
+        self._send.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._send.setToolTip("Send message")
+        self._send.setFixedHeight(Composer.ACTION_HEIGHT)
+        row.addWidget(self.prompt, 1)
+        row.addWidget(self._cancel, 0, Qt.AlignmentFlag.AlignBottom)
+        row.addWidget(self._send, 0, Qt.AlignmentFlag.AlignBottom)
+        dock_layout.addLayout(row)
         self._context = QLabel("")
         self._context.setObjectName("context")
         self._context.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        footer_layout.addWidget(hint)
-        footer_layout.addWidget(self._context, 1)
-        root.addWidget(footer)
+        dock_layout.addWidget(self._context)
+        root.addWidget(dock)
 
         settings.clicked.connect(self.open_settings.emit)
         home.clicked.connect(self.leave_requested.emit)
@@ -121,12 +136,17 @@ class ChatView(QWidget):
         self._latest.clicked.connect(self.jump_to_latest)
         self._turn_input.returnPressed.connect(self._submit_turn)
         self.prompt.submitted.connect(self._submit_prompt)
+        self.prompt.textChanged.connect(self._sync_composer_actions)
+        self.prompt.expand_requested.connect(self._open_composer_pad)
+        self._send.clicked.connect(self._send_prompt)
+        self._cancel.clicked.connect(self.cancel_prompt)
         self.transcript.reached_top.connect(self._on_reached_top)
         self.transcript.reached_bottom.connect(self._on_reached_bottom)
         self.transcript.viewport_turn_changed.connect(lambda _turn: self._update_history_toolbar())
         self.transcript.record_copied.connect(
             lambda label: self.notify.emit(f"{label} message copied", "information", "")
         )
+        self._sync_composer_actions()
 
     def _connect_bridge(self) -> None:
         bridge = self.bridge
@@ -157,6 +177,9 @@ class ChatView(QWidget):
         ):
             with suppress(RuntimeError, TypeError):
                 signal.disconnect(slot)
+        if self._pad is not None:
+            self._pad.close()
+            self._pad = None
 
     def _forward_approval(self, ask: object) -> None:
         self.approval_asked.emit(ask)
@@ -228,8 +251,39 @@ class ChatView(QWidget):
         if self.busy:
             self.bridge.cancel_prompt()
             self._set_status(f"{self._session_label} · cancelling…")
+            self._sync_composer_actions()
         else:
             self.focus_prompt()
+
+    def _send_prompt(self) -> None:
+        self._submit_prompt(self.prompt.text)
+
+    def _open_composer_pad(self) -> None:
+        if self._pad is not None:
+            self._pad.raise_()
+            self._pad.activateWindow()
+            return
+        pad = ComposerPad(
+            self.prompt.text,
+            running=self.busy,
+            enabled=self.prompt.isEnabled(),
+            parent=self,
+        )
+        self._pad = pad
+        pad.submitted.connect(self._submit_prompt)
+        pad.cancelled.connect(self.cancel_prompt)
+        pad.finished.connect(self._on_pad_finished)
+        pad.open()
+
+    def _on_pad_finished(self, _result: int) -> None:
+        pad = self._pad
+        self._pad = None
+        if pad is None:
+            return
+        if not pad.sent:
+            self.prompt.text = pad.text
+        self._sync_composer_actions()
+        self.focus_prompt()
 
     def load_older_history(self) -> None:
         self.bridge.load_older(self._display_turn())
@@ -343,11 +397,13 @@ class ChatView(QWidget):
             return
         if self.session_id:
             self._set_status(f"session {self.session_id} · running")
+        self._sync_composer_actions()
 
     def _on_input_enabled(self, enabled: bool, epoch: int) -> None:
         if epoch != self.bridge.epoch:
             return
         self.prompt.setEnabled(enabled)
+        self._sync_composer_actions()
         if enabled:
             self.prompt.setFocus()
         if enabled and self.session_id:
@@ -359,6 +415,7 @@ class ChatView(QWidget):
         if epoch != self.bridge.epoch:
             return
         self.transcript.finish_stream()
+        self._sync_composer_actions()
 
     def _on_reached_top(self) -> None:
         if self._history_total <= 0 or self._history_loading:
@@ -369,6 +426,18 @@ class ChatView(QWidget):
         if self._history_total <= 0 or self._history_loading:
             return
         self.bridge.prefetch_newer()
+
+    def _sync_composer_actions(self) -> None:
+        running = self.busy
+        source = self._pad.text if self._pad is not None else self.prompt.text
+        has_text = bool(source.strip())
+        self._send.setVisible(not running)
+        self._send.setEnabled(self.prompt.isEnabled() and has_text and not running)
+        self._cancel.setVisible(running)
+        self._cancel.setEnabled(running)
+        if self._pad is not None:
+            self._pad.set_running(running)
+            self._pad.set_enabled(self.prompt.isEnabled())
 
     def _display_turn(self) -> int:
         total = self._history_total

@@ -4,35 +4,107 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QKeySequence, QShortcut
-from PySide6.QtWidgets import QDialog, QLabel, QMainWindow, QStackedWidget, QWidget
+from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt, QTimer
+from PySide6.QtGui import QKeySequence, QMouseEvent, QShortcut
+from PySide6.QtWidgets import (
+    QDialog,
+    QGraphicsOpacityEffect,
+    QLabel,
+    QMainWindow,
+    QStackedWidget,
+    QWidget,
+)
 
 from kimix_tui.qt.chat_view import ChatView
 from kimix_tui.qt.home_view import HomeView
 from kimix_tui.qt.request_dialogs import ApprovalDialog, DeleteSessionsDialog, QuestionDialog
-from kimix_tui.qt.theme import COLORS
 
 if TYPE_CHECKING:
     from kimix_tui.app import KimixTuiApp
 
 
 class Toast(QLabel):
+    """Centered snackbar that auto-hides after a short delay."""
+
+    INFO_MS = 2_200
+    WARN_MS = 4_000
+
     def __init__(self, parent: QWidget) -> None:
         super().__init__(parent)
         self.setObjectName("toast")
-        self.setStyleSheet(
-            f"background: {COLORS['panel']}; color: {COLORS['text']}; "
-            f"border: 1px solid {COLORS['border']}; border-radius: 8px; padding: 8px 12px;"
-        )
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setWordWrap(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._effect = QGraphicsOpacityEffect(self)
+        self._effect.setOpacity(1.0)
+        self.setGraphicsEffect(self._effect)
+        self._fade = QPropertyAnimation(self._effect, b"opacity", self)
+        self._fade.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._fade.finished.connect(self._on_fade_finished)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._fade_out)
+        self._hiding = False
         self.hide()
 
-    def show_message(self, message: str, title: str = "") -> None:
+    def show_message(
+        self,
+        message: str,
+        title: str = "",
+        *,
+        severity: str = "information",
+        duration_ms: int | None = None,
+    ) -> None:
+        self._hiding = False
+        self._fade.stop()
+        self._timer.stop()
+        self._effect.setOpacity(1.0)
         self.setText(f"{title}\n{message}" if title else message)
+        parent = self.parentWidget()
+        self.setMaximumWidth(max(240, (parent.width() if parent is not None else 420) - 48))
         self.adjustSize()
-        self.move(16, self.parent().height() - self.height() - 16)  # type: ignore[union-attr]
+        self.reposition()
         self.show()
         self.raise_()
+        if duration_ms is None:
+            duration_ms = self.WARN_MS if severity == "warning" else self.INFO_MS
+        if duration_ms > 0:
+            self._timer.start(duration_ms)
+
+    def reposition(self) -> None:
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        self.adjustSize()
+        x = max(16, (parent.width() - self.width()) // 2)
+        y = max(16, parent.height() - self.height() - 28)
+        self.move(x, y)
+
+    def mousePressEvent(self, event: object) -> None:
+        if isinstance(event, QMouseEvent):
+            self._timer.stop()
+            self._fade_out()
+            event.accept()
+            return
+        super().mousePressEvent(event)  # type: ignore[arg-type]
+
+    def _fade_out(self) -> None:
+        if not self.isVisible():
+            return
+        self._hiding = True
+        self._fade.stop()
+        self._fade.setDuration(160)
+        self._fade.setStartValue(max(0.0, self._effect.opacity()))
+        self._fade.setEndValue(0.0)
+        self._fade.start()
+
+    def _on_fade_finished(self) -> None:
+        if not self._hiding:
+            return
+        self.hide()
+        self._hiding = False
+        self._effect.setOpacity(1.0)
 
 
 class MainWindow(QMainWindow):
@@ -171,7 +243,7 @@ class MainWindow(QMainWindow):
 
     def show_notification(self, message: str, severity: str = "information", title: str = "") -> None:
         self.controller.note(message, severity, title)
-        self._toast.show_message(message, title)
+        self._toast.show_message(message, title, severity=severity)
 
     def _install_shortcuts(self) -> None:
         QShortcut(QKeySequence(Qt.Key.Key_F4), self, self._shortcut_settings)
@@ -225,3 +297,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: object) -> None:
         self.controller.shutdown()
         super().closeEvent(event)  # type: ignore[arg-type]
+
+    def resizeEvent(self, event: object) -> None:
+        super().resizeEvent(event)  # type: ignore[arg-type]
+        if self._toast.isVisible():
+            self._toast.reposition()

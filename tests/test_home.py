@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtWidgets import QApplication, QLabel, QLineEdit, QPushButton
+from PySide6.QtWidgets import QApplication, QCheckBox, QLabel, QLineEdit, QPushButton
 from qtutil import find, launch_app, wait_chat_ready, wait_home, wait_idle, widget_text
 
 from kimix_tui.app import KimixTuiApp
@@ -210,6 +210,29 @@ def test_click_previews_session_before_opening(qtbot, tmp_path: Path) -> None:
     assert isinstance(app.screen, ChatView)
 
 
+def test_double_click_opens_session(qtbot, tmp_path: Path) -> None:
+    opened: list[SessionOptions] = []
+    session = FakeSession("sess-2")
+
+    async def factory(options: SessionOptions) -> FakeSession:
+        opened.append(options)
+        return session
+
+    app = KimixTuiApp(
+        SessionOptions(tmp_path),
+        session_factory=factory,
+        session_loader=_history_loader,
+        config_store=_config_store(tmp_path),
+    )
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    rows = home.session_rows()
+    qtbot.mouseDClick(rows[1], Qt.MouseButton.LeftButton, pos=QPoint(90, 14))
+    wait_chat_ready(qtbot, app)
+    assert opened[0].session_id == "sess-2"
+    assert isinstance(app.screen, ChatView)
+
+
 def test_click_session_check_toggles_selection(qtbot, tmp_path: Path) -> None:
     app = KimixTuiApp(
         SessionOptions(tmp_path),
@@ -220,17 +243,49 @@ def test_click_session_check_toggles_selection(qtbot, tmp_path: Path) -> None:
     home = wait_home(qtbot, app)
     rows = home.session_rows()
     first = rows[0].summary
-    qtbot.mouseClick(rows[1], Qt.MouseButton.LeftButton, pos=QPoint(8, 8))
+    mark = find(rows[1], "session-check", QCheckBox)
+    assert mark.text() == ""
+    qtbot.mouseClick(mark, Qt.MouseButton.LeftButton)
 
     assert rows[1].selected is True
-    assert find(rows[1], "session-check", QLabel).text() == "[x]"
+    assert mark.isChecked() is True
+    session_list = find(home, "session-list")
+    list_y = session_list.y()
+    list_height = session_list.height()
     assert widget_text(home, "selection-count") == "1 selected"
+    assert find(home, "selection-count").isVisible()
+    assert not find(home, "history-title").isVisible()
+    assert find(home, "delete-sessions", QPushButton).isVisible()
+    assert find(home, "delete-sessions", QPushButton).isEnabled()
+    assert session_list.y() == list_y
+    assert session_list.height() == list_height
     assert home.summary == first
 
-    qtbot.mouseClick(rows[1], Qt.MouseButton.LeftButton, pos=QPoint(8, 8))
+    qtbot.mouseClick(mark, Qt.MouseButton.LeftButton)
     assert rows[1].selected is False
-    assert find(rows[1], "session-check", QLabel).text() == "[ ]"
-    assert widget_text(home, "selection-count") == "0 selected"
+    assert mark.isChecked() is False
+    assert not find(home, "selection-count").isVisible()
+    assert find(home, "history-title").isVisible()
+    assert not find(home, "delete-sessions", QPushButton).isVisible()
+    assert session_list.y() == list_y
+    assert session_list.height() == list_height
+
+
+def test_home_session_rows_use_badges_instead_of_ascii_checks(qtbot, tmp_path: Path) -> None:
+    app = KimixTuiApp(
+        SessionOptions(tmp_path),
+        session_loader=_history_loader,
+        config_store=_config_store(tmp_path),
+    )
+    launch_app(qtbot, app)
+    home = wait_home(qtbot, app)
+    rows = home.session_rows()
+    assert find(rows[0], "session-badge", QLabel).text() == "Last"
+    assert find(rows[1], "session-badge", QLabel).text() == "Archived"
+    for row in rows:
+        assert find(row, "session-check", QCheckBox).text() == ""
+        assert "[ ]" not in widget_text(row, "session-title")
+        assert "[x]" not in widget_text(row, "session-title")
 
 
 def test_home_filters_sessions_by_title(qtbot, tmp_path: Path) -> None:
@@ -265,10 +320,16 @@ def test_home_selects_and_deletes_sessions_in_batch(qtbot, tmp_path: Path) -> No
     )
     launch_app(qtbot, app)
     home = wait_home(qtbot, app)
+    session_list = find(home, "session-list")
+    list_y = session_list.y()
     find(home, "select-shown", QPushButton).click()
     assert widget_text(home, "selection-count") == "2 selected"
+    assert find(home, "selection-count").isVisible()
     assert find(home, "delete-sessions", QPushButton).isEnabled()
+    assert session_list.y() == list_y
     assert all(row.selected for row in home.session_rows())
+    assert all(find(row, "session-check", QCheckBox).isChecked() for row in home.session_rows())
+    assert find(home, "select-shown", QPushButton).text() == "Clear"
 
     find(home, "delete-sessions", QPushButton).click()
     qtbot.waitUntil(lambda: isinstance(app.screen, DeleteSessionsDialog), timeout=10_000)
@@ -279,7 +340,9 @@ def test_home_selects_and_deletes_sessions_in_batch(qtbot, tmp_path: Path) -> No
     assert deleted == ["sess-1", "sess-2"]
     assert app.screen is home
     assert home.session_rows() == []
-    assert widget_text(home, "selection-count") == "0 selected"
+    assert not find(home, "selection-count").isVisible()
+    assert find(home, "history-title").isVisible()
+    assert not find(home, "delete-sessions", QPushButton).isVisible()
 
 
 def test_enter_resumes_highlighted_session(qtbot, tmp_path: Path) -> None:
@@ -401,6 +464,6 @@ def test_home_stacks_sections_on_narrow_window(qtbot, tmp_path: Path) -> None:
     assert details.y() > browser.y()
     assert abs(details.x() - browser.x()) < 8
     assert find(home, "open-session").geometry().bottom() <= details.geometry().bottom()
-    assert find(home, "toggle-session").geometry().right() <= details.geometry().right()
-    assert find(home, "delete-sessions").geometry().right() <= browser.geometry().right()
+    assert find(home, "configure-session").geometry().right() <= details.geometry().right()
+    assert find(home, "select-shown").geometry().right() <= browser.geometry().right()
     assert find(home, "session-list").height() > 0
