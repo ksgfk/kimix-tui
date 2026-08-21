@@ -424,7 +424,7 @@ def test_composer_expand_emits_and_pad_sends_long_text(qtbot) -> None:
     assert pad.sent is True
 
 
-def test_composer_pad_keeps_draft_and_uses_ctrl_enter(qtbot) -> None:
+def test_composer_pad_enter_newlines_send_requires_click(qtbot) -> None:
     pad = ComposerPad("hello")
     submitted: list[str] = []
     pad.submitted.connect(submitted.append)
@@ -434,11 +434,19 @@ def test_composer_pad_keeps_draft_and_uses_ctrl_enter(qtbot) -> None:
     assert editor is not None
     editor.setFocus()
     editor.setPlainText("hello\nworld")
+    cursor = editor.textCursor()
+    cursor.movePosition(cursor.MoveOperation.End)
+    editor.setTextCursor(cursor)
     qtbot.keyClick(editor, Qt.Key.Key_Return)
     assert submitted == []
-    editor.setPlainText("hello\nworld")
+    assert editor.toPlainText() == "hello\nworld\n"
     qtbot.keyClick(editor, Qt.Key.Key_Return, Qt.KeyboardModifier.ControlModifier)
-    assert submitted == ["hello\nworld"]
+    assert submitted == []
+    assert editor.toPlainText() == "hello\nworld\n"
+    send = pad.findChild(QPushButton, "send-pad")
+    assert send is not None
+    send.click()
+    assert submitted == ["hello\nworld\n"]
 
 
 def test_toast_centers_at_bottom_and_auto_hides(qtbot) -> None:

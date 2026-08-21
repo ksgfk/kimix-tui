@@ -107,7 +107,7 @@ class ChatView(QWidget):
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(8)
-        self.prompt = Composer("Ask AI, or type /help. Ctrl+Enter for a new line")
+        self.prompt = Composer("Ask AI, or type /help. Enter to send · Ctrl+Enter for a new line")
         self.prompt.setEnabled(False)
         self._cancel = QPushButton("Cancel")
         self._cancel.setObjectName("cancel-prompt")

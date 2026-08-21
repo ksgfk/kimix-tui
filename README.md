@@ -76,8 +76,8 @@ uv run kimix-tui --config=C:\path\to\provider.json
 
 | 键 | 行为 |
 |---|---|
-| `Enter` | 主页打开高亮会话；聊天中发送输入 |
-| `Ctrl+Enter` / `Shift+Enter` | 聊天输入框换行 |
+| `Enter` | 主页打开高亮会话；聊天输入框发送；Compose 换行 |
+| `Ctrl+Enter` / `Shift+Enter` | 聊天输入框换行。Compose 中 `Ctrl+Enter` 不发送也不换行，需点 Send |
 | `n` | 主页新建 session |
 | `q` / `Esc` | 主页退出进程 |
 | `Esc` | 聊天中关闭当前会话并回到主页 |

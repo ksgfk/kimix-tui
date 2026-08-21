@@ -134,19 +134,19 @@ class Composer(QPlainTextEdit):
 
 
 class _PadEditor(QPlainTextEdit):
-    submitted = Signal()
+    """Writing surface: Enter newlines, Ctrl+Enter is ignored, Send is a button."""
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and event.modifiers() & (
             Qt.KeyboardModifier.ControlModifier
         ):
-            self.submitted.emit()
+            event.accept()
             return
         super().keyPressEvent(event)
 
 
 class ComposerPad(QDialog):
-    """Large prompt editor that mirrors the compact composer actions."""
+    """Large writing pad: Enter inserts a newline, sending requires the Send button."""
 
     submitted = Signal(str)
     cancelled = Signal()
@@ -202,7 +202,7 @@ class ComposerPad(QDialog):
         header.installEventFilter(self)
         layout.addWidget(header)
 
-        hint = QLabel("Enter for a new line · Ctrl+Enter to send")
+        hint = QLabel("Enter for a new line · Click Send")
         hint.setObjectName("composer-pad-hint")
         layout.addWidget(hint)
 
@@ -220,10 +220,14 @@ class ComposerPad(QDialog):
         self._cancel = QPushButton("Cancel")
         self._cancel.setObjectName("cancel-pad")
         self._cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cancel.setAutoDefault(False)
+        self._cancel.setDefault(False)
         self._cancel.setFixedHeight(Composer.ACTION_HEIGHT)
         self._send = QPushButton("Send")
         self._send.setObjectName("send-pad")
         self._send.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._send.setAutoDefault(False)
+        self._send.setDefault(False)
         self._send.setFixedHeight(Composer.ACTION_HEIGHT)
         row.addWidget(self._editor, 1)
         row.addWidget(self._cancel, 0, Qt.AlignmentFlag.AlignBottom)
@@ -239,7 +243,6 @@ class ComposerPad(QDialog):
         layout.addLayout(footer)
         root.addWidget(card)
 
-        self._editor.submitted.connect(self._send_text)
         self._editor.textChanged.connect(self._on_text_changed)
         self._send.clicked.connect(self._send_text)
         self._cancel.clicked.connect(self.cancelled.emit)
